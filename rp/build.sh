@@ -102,3 +102,8 @@ if [ "$BUILD_TYPE" = "release" ]; then
 else
     cp build/rp.uf2 dist/rp-$BOARD_TYPE-$BUILD_TYPE.uf2
 fi
+
+# Restore the patched fatfs-sdk file so the submodule stays clean
+cd ..
+git -C fatfs-sdk checkout src/include/ffconf.h
+cd rp
