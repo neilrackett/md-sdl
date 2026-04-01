@@ -1,0 +1,55 @@
+# AGENTS.md — Microfirmware Template Playbook
+
+Welcome to the md-microfirmware-template workspace. This is the quick primer so any agent can get productive fast.
+
+## 1. Environment setup (do this before touching the repo)
+- **Host tooling**
+  - ARM GNU Toolchain 14.2 at `/Applications/ArmGNUToolchain/14.2.rel1/arm-none-eabi/bin` (export `PICO_TOOLCHAIN_PATH` to this path).
+  - Raspberry Pi Debug Probe / Picoprobe wired to the Multi-device header (TX, RX and both GND pins **must** be connected).
+  - `atarist-toolkit-docker` installed and working (`stcmd` requires a PTY, so run with `pty=true`).
+  - Git + GNU Make + VS Code with the C/C++ Extension Pack, CMake Tools and Cortex-Debug.
+- **SDK environment variables** (add them to your shell profile):
+  ```bash
+  export PICO_SDK_PATH=$REPO_ROOT/pico-sdk
+  export PICO_EXTRAS_PATH=$REPO_ROOT/pico-extras
+  export FATFS_SDK_PATH=$REPO_ROOT/fatfs-sdk
+  ```
+- **Optional debugger helpers**
+  ```bash
+  export ARM_GDB_PATH=/path/to/arm-none-eabi/bin
+  export PICO_OPENOCD_PATH=/path/to/openocd/tcl
+  ```
+- **Workspace root:** `/Users/openclaw/.openclaw/workspace/md-microfirmware-template`
+
+## 2. Common Commands
+```bash
+# List workspace via stcmd (requires PTY)
+stcmd ls
+
+# Build firmware (example board + UUID)
+cd md-microfirmware-template
+PICO_TOOLCHAIN_PATH=/Applications/ArmGNUToolchain/14.2.rel1/arm-none-eabi/bin \
+  ./build.sh pico_w release 123e4567-e89b-12d3-a456-426614174000
+```
+
+## 3. Build Notes & Gotchas
+- `CHARACTER_GAP_MS` constant lives in `rp/src/include/blink.h`. Keep it defined (700 ms) or the RP build fails.
+- Expect harmless VASM warnings (`target data type overflow`, `trailing garbage after option -D`).
+- The build script auto-copies `version.txt`, rebuilds the Atari target, then the RP target.
+- Successful builds drop UF2s into `dist/` as `<UUID>-v<version>.uf2` and print the MD5 used in the generated JSON manifest.
+
+## 4. Troubleshooting
+| Symptom | Fix |
+| --- | --- |
+| `the input device is not a TTY` when using `stcmd` | Re-run the command with `pty=true` |
+| `arm-none-eabi-gcc not found` | Ensure `PICO_TOOLCHAIN_PATH` points to the Arm GNU toolchain bin dir |
+| Build stops with missing `CHARACTER_GAP_MS` | Re-add `#define CHARACTER_GAP_MS 700` to `rp/src/include/blink.h` |
+| Final steps fail copying UF2 | Upstream compile failed—scroll back for the first error before the copy step |
+
+## 5. Editing Guardrails
+- Agents are **not allowed** to modify code inside these directories under any circumstances:
+  - `/fatfs-sdk`
+  - `/pico-sdk`
+  - `/pico-extras`
+
+Keep this file updated as the process evolves so every agent starts with the latest tribal knowledge.
