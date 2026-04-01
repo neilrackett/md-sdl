@@ -1,479 +1,595 @@
 /**
  * File: emul.c
- * Author: Diego Parrilla Santamaría
- * Date: February 2025, February 2026
- * Copyright: 2025-2026 - GOODDATA LABS
- * Description: Template code for the core emulation
+ * Description: MD/SDL microfirmware — SDL 1.2 video offload for Atari ST.
+ *
+ * The RP2040 acts as a C2P co-processor and framebuffer server.  The Atari ST
+ * sends chunky pixel data and palette information over the cartridge bus; the
+ * RP2040 performs median-cut palette reduction and chunky-to-planar conversion,
+ * then writes the resulting ST low-res planar frame into the ROM4 window at
+ * $FA8000 where the ST reads it back directly.
  */
 
 #include "emul.h"
 
 #include <stdint.h>
+#include <string.h>
 
-// inclusw in the C file to avoid multiple definitions
-#include "target_firmware.h"  // Include the target firmware binary
+/* Included in the .c to avoid multiple-definition errors */
+#include "target_firmware.h"
 
-#include "aconfig.h"
 #include "constants.h"
 #include "debug.h"
 #include "display.h"
-#include "ff.h"
-#include "gconfig.h"
+#include "hardware/sync.h"
 #include "memfunc.h"
-#include "network.h"
 #include "pico/stdlib.h"
 #include "reset.h"
 #include "romemul.h"
-#include "sdcard.h"
-#include "select.h"
-#include "term.h"
+#include "sdl_commands.h"
+#include "tprotocol.h"
 
-#define SLEEP_LOOP_MS 100
+/* =========================================================================
+ * Shared surface state (exported via sdl_commands.h)
+ * ========================================================================= */
+uint8_t  sdl_md_chunky[SDL_MD_CHUNKY_SIZE];
+uint8_t  sdl_md_pal_map[256];
+uint16_t sdl_md_hw_pal[16];
+uint16_t sdl_md_width  = SDL_MD_MAX_WIDTH;
+uint16_t sdl_md_height = SDL_MD_MAX_HEIGHT;
+uint8_t  sdl_md_bpp    = 8;
 
-enum {
-  APP_MODE_SETUP = 255  // Setup
+/* =========================================================================
+ * ROM_IN_RAM sub-addresses (computed from __rom_in_ram_start__ at init)
+ * ========================================================================= */
+static uint32_t mem_framebuffer_addr;
+static uint32_t mem_random_token_addr;
+static uint32_t mem_palette_return_addr;
+
+/* =========================================================================
+ * Protocol double-buffer (same pattern as term.c)
+ * ========================================================================= */
+static TransmissionProtocol protocol_buffers[2];
+static volatile uint8_t  protocol_read_index  = 0;
+static volatile uint8_t  protocol_write_index = 1;
+static volatile bool     protocol_buffer_ready = false;
+
+/* =========================================================================
+ * Default 16-colour EGA palette
+ * STE format: 0x0RGB, 4 bits per channel (0-15)
+ * ========================================================================= */
+static const uint16_t ega_palette[16] = {
+    0x0000,  /*  0 Black        */
+    0x0007,  /*  1 Dark Blue    */
+    0x0070,  /*  2 Dark Green   */
+    0x0077,  /*  3 Dark Cyan    */
+    0x0700,  /*  4 Dark Red     */
+    0x0707,  /*  5 Dark Magenta */
+    0x0770,  /*  6 Brown        */
+    0x0777,  /*  7 Light Gray   */
+    0x0333,  /*  8 Dark Gray    */
+    0x000F,  /*  9 Blue         */
+    0x00F0,  /* 10 Green        */
+    0x00FF,  /* 11 Cyan         */
+    0x0F00,  /* 12 Red          */
+    0x0F0F,  /* 13 Magenta      */
+    0x0FF0,  /* 14 Yellow       */
+    0x0FFF,  /* 15 White        */
 };
 
-// Command handlers
-static void cmdMenu(const char *arg);
-static void cmdClear(const char *arg);
-static void cmdExit(const char *arg);
-static void cmdHelp(const char *arg);
-static void cmdBooster(const char *arg);
-static void cmdSettings(const char *arg);
-static void cmdPrint(const char *arg);
-static void cmdSave(const char *arg);
-static void cmdErase(const char *arg);
-static void cmdGet(const char *arg);
-static void cmdPutInt(const char *arg);
-static void cmdPutBool(const char *arg);
-static void cmdPutString(const char *arg);
-
-// Command table
-static const Command commands[] = {
-    {"m", cmdMenu},
-    {"h", cmdHelp},
-    {"e", cmdExit},
-    {"x", cmdBooster},
-    {"?", cmdHelp},
-    {"s", cmdSettings},
-    {"settings", cmdSettings},
-    {"print", cmdPrint},
-    {"save", cmdSave},
-    {"erase", cmdErase},
-    {"get", cmdGet},
-    {"put_int", cmdPutInt},
-    {"put_bool", cmdPutBool},
-    {"put_str", cmdPutString},
-};
-
-// Number of commands in the table
-static const size_t numCommands = sizeof(commands) / sizeof(commands[0]);
-
-// Keep active loop or exit
-static bool keepActive = true;
-static bool menuScreenActive = false;
-static absolute_time_t menuRefreshTime;
-
-#define MENU_REFRESH_TIME_MS 1000
-
-// Should we reset the device, or jump to the booster app?
-// By default, we reset the device.
-static bool resetDeviceAtBoot = true;
-
-static void showTitle() {
-  term_printString(
-      "\x1B"
-      "E"
-      "Microfirmware test app - " RELEASE_VERSION "\n");
+/* Convert a 4-bit STE channel value (0-15) to 8-bit linear (0-255) */
+static inline uint8_t ste_chan_to_8bit(uint8_t c4) {
+    return (uint8_t)((c4 << 4) | c4);
 }
 
-static void menu(void) {
-  menuScreenActive = true;
-  showTitle();
-  term_printString("\n\n");
-  term_printString("[S]ettings     | Back to this [M]enu\n");
-  term_printString("[E]xit desktop | [X] Back to Booster\n\n");
-
-  // Display network information
-  term_printNetworkInfo();
-
-  term_printString("\n");
-  term_printString("Select an option: ");
-  term_markMenuPromptCursor();
-  menuRefreshTime = make_timeout_time_ms(MENU_REFRESH_TIME_MS);
+/* Squared Euclidean distance in RGB space */
+static inline int rgb_dist2(int r1, int g1, int b1, int r2, int g2, int b2) {
+    int dr = r1 - r2, dg = g1 - g2, db = b1 - b2;
+    return dr*dr + dg*dg + db*db;
 }
 
-// Command handlers
-void cmdMenu(const char *arg) { menu(); }
-
-void cmdHelp(const char *arg) {
-  menuScreenActive = false;
-  // term_printString("\x1B" "E" "Available commands:\n");
-  term_printString("Available commands:\n");
-  term_printString(" General:\n");
-  term_printString("  clear   - Clear the terminal screen\n");
-  term_printString("  exit    - Exit the terminal\n");
-  term_printString("  help    - Show available commands\n");
+/* Build pal_map from current hw_pal and a 768-byte RGB source */
+static void build_pal_map(const uint8_t *rgb768) {
+    /* Pre-expand hw_pal to 8-bit RGB for distance calc */
+    uint8_t hr[16], hg[16], hb[16];
+    for (int i = 0; i < 16; i++) {
+        uint16_t c = sdl_md_hw_pal[i];
+        hr[i] = ste_chan_to_8bit((c >> 8) & 0xF);
+        hg[i] = ste_chan_to_8bit((c >> 4) & 0xF);
+        hb[i] = ste_chan_to_8bit(c & 0xF);
+    }
+    for (int i = 0; i < 256; i++) {
+        uint8_t r = rgb768[i*3 + 0];
+        uint8_t g = rgb768[i*3 + 1];
+        uint8_t b = rgb768[i*3 + 2];
+        int best = 0, best_d = 0x7FFFFFFF;
+        for (int j = 0; j < 16; j++) {
+            int d = rgb_dist2(r, g, b, hr[j], hg[j], hb[j]);
+            if (d < best_d) { best_d = d; best = j; }
+        }
+        sdl_md_pal_map[i] = (uint8_t)best;
+    }
 }
 
-void cmdClear(const char *arg) {
-  menuScreenActive = false;
-  term_clearScreen();
+static void init_default_palette(void) {
+    memcpy(sdl_md_hw_pal, ega_palette, sizeof(ega_palette));
+
+    /* Build a synthetic "all-indices" rgb table from EGA colors for pal_map */
+    uint8_t rgb[768];
+    for (int i = 0; i < 256; i++) {
+        uint16_t c = ega_palette[i & 15];
+        rgb[i*3 + 0] = ste_chan_to_8bit((c >> 8) & 0xF);
+        rgb[i*3 + 1] = ste_chan_to_8bit((c >> 4) & 0xF);
+        rgb[i*3 + 2] = ste_chan_to_8bit(c & 0xF);
+    }
+    build_pal_map(rgb);
 }
 
-void cmdExit(const char *arg) {
-  menuScreenActive = false;
-  term_printString("Exiting terminal...\n");
-  // Send continue to desktop command
-  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_CONTINUE);
+/* Write hw palette to the ST-visible palette return area */
+static void write_palette_return(void) {
+    volatile uint16_t *dest = (volatile uint16_t *)mem_palette_return_addr;
+    for (int i = 0; i < 16; i++) {
+        dest[i] = sdl_md_hw_pal[i];
+    }
 }
 
-void cmdBooster(const char *arg) {
-  menuScreenActive = false;
-  term_printString("Launching Booster app...\n");
-  term_printString("The computer will boot shortly...\n\n");
-  term_printString("If it doesn't boot, power it on and off.\n");
-  resetDeviceAtBoot = false;  // Jump to the booster app
-  keepActive = false;         // Exit the active loop
-}
+/* =========================================================================
+ * Median-cut palette reduction
+ * Input:  rgb768  — 256 × 3 bytes (R, G, B)
+ * Output: hw_pal_out[16] in STE format, pal_map_out[256]
+ * ========================================================================= */
 
-void cmdSettings(const char *arg) {
-  menuScreenActive = false;
-  term_cmdSettings(arg);
-}
+typedef struct {
+    uint8_t r_min, r_max;
+    uint8_t g_min, g_max;
+    uint8_t b_min, b_max;
+    uint8_t indices[256];  /* logical color indices in this box */
+    int     count;
+} MedianBox;
 
-void cmdPrint(const char *arg) {
-  menuScreenActive = false;
-  term_cmdPrint(arg);
-}
+static void median_cut(const uint8_t *rgb768, uint16_t *hw_pal_out,
+                       uint8_t *pal_map_out) {
+    static MedianBox boxes[16];
+    int num_boxes = 1;
 
-void cmdSave(const char *arg) {
-  menuScreenActive = false;
-  term_cmdSave(arg);
-}
+    /* Initialise the single box with all 256 colors */
+    MedianBox *b0 = &boxes[0];
+    b0->r_min = 255; b0->r_max = 0;
+    b0->g_min = 255; b0->g_max = 0;
+    b0->b_min = 255; b0->b_max = 0;
+    b0->count = 0;
 
-void cmdErase(const char *arg) {
-  menuScreenActive = false;
-  term_cmdErase(arg);
-}
+    for (int i = 0; i < 256; i++) {
+        uint8_t r = rgb768[i*3 + 0];
+        uint8_t g = rgb768[i*3 + 1];
+        uint8_t b = rgb768[i*3 + 2];
+        if (r < b0->r_min) b0->r_min = r;
+        if (r > b0->r_max) b0->r_max = r;
+        if (g < b0->g_min) b0->g_min = g;
+        if (g > b0->g_max) b0->g_max = g;
+        if (b < b0->b_min) b0->b_min = b;
+        if (b > b0->b_max) b0->b_max = b;
+        b0->indices[b0->count++] = (uint8_t)i;
+    }
 
-void cmdGet(const char *arg) {
-  menuScreenActive = false;
-  term_cmdGet(arg);
-}
-
-void cmdPutInt(const char *arg) {
-  menuScreenActive = false;
-  term_cmdPutInt(arg);
-}
-
-void cmdPutBool(const char *arg) {
-  menuScreenActive = false;
-  term_cmdPutBool(arg);
-}
-
-void cmdPutString(const char *arg) {
-  menuScreenActive = false;
-  term_cmdPutString(arg);
-}
-
-// This section contains the functions that are called from the main loop
-
-static bool getKeepActive() { return keepActive; }
-
-static bool getResetDevice() { return resetDeviceAtBoot; }
-
-static void preinit() {
-  // Initialize the terminal
-  term_init();
-
-  // Clear the screen
-  term_clearScreen();
-
-  // Show the title
-  showTitle();
-  term_printString("\n\n");
-  term_printString("Configuring network... please wait...\n");
-
-  display_refresh();
-}
-
-void failure(const char *message) {
-  // Initialize the terminal
-  term_init();
-
-  // Clear the screen
-  term_clearScreen();
-
-  // Show the title
-  showTitle();
-  term_printString("\n\n");
-  term_printString(message);
-
-  display_refresh();
-}
-
-static void init(void) {
-  // Set the command table
-  term_setCommands(commands, numCommands);
-
-  // Clear the screen
-  term_clearScreen();
-
-  // Display the menu
-  menu();
-
-  // Example 1: Move the cursor up one line.
-  // VT52 sequence: ESC A (moves cursor up)
-  // The escape sequence "\x1BA" will move the cursor up one line.
-  // term_printString("\x1B" "A");
-  // After moving up, print text that overwrites part of the previous line.
-  // term_printString("Line 2 (modified by ESC A)\n");
-
-  // Example 2: Move the cursor right one character.
-  // VT52 sequence: ESC C (moves cursor right)
-  // term_printString("\x1B" "C");
-  // term_printString(" <-- Moved right with ESC C\n");
-
-  // Example 3: Direct cursor addressing.
-  // VT52 direct addressing uses ESC Y <row> <col>, where:
-  //   row_char = row + 0x20, col_char = col + 0x20.
-  // For instance, to move the cursor to row 0, column 10:
-  //   row: 0 -> 0x20 (' ')
-  //   col: 10 -> 0x20 + 10 = 0x2A ('*')
-  // term_printString("\x1B" "Y" "\x20" "\x2A");
-  // term_printString("Text at row 0, column 10 via ESC Y\n");
-
-  // term_printString("\x1B" "Y" "\x2A" "\x20");
-
-  display_refresh();
-}
-
-void emul_start() {
-  // The anatomy of an app or microfirmware is as follows:
-  // - The driver code running in the remote device (the computer)
-  // - the driver code running in the host device (the rp2040/rp2350)
-  //
-  // The driver code running in the remote device is responsible for:
-  // 1. Perform the emulation of the device (ex: a ROM cartridge)
-  // 2. Handle the communication with the host device
-  // 3. Handle the configuration of the driver (ex: the ROM file to load)
-  // 4. Handle the communication with the user (ex: the terminal)
-  //
-  // The driver code running in the host device is responsible for:
-  // 1. Handle the communication with the remote device
-  // 2. Handle the configuration of the driver (ex: the ROM file to load)
-  // 3. Handle the communication with the user (ex: the terminal)
-  //
-  // Hence, we effectively have two drivers running in two different devices
-  // with different architectures and capabilities.
-  //
-  // Please read the documentation to learn to use the communication protocol
-  // between the two devices in the tprotocol.h file.
-  //
-
-  // 1. Check if the host device must be initialized to perform the emulation
-  //    of the device, or start in setup/configuration mode
-  SettingsConfigEntry *appMode =
-      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_MODE);
-  int appModeValue = APP_MODE_SETUP;  // Setup menu
-  if (appMode == NULL) {
-    DPRINTF(
-        "APP_MODE_SETUP not found in the configuration. Using default value\n");
-  } else {
-    appModeValue = atoi(appMode->value);
-    DPRINTF("Start emulation in mode: %i\n", appModeValue);
-  }
-
-  // 2. Initialiaze the normal operation of the app, unless the configuration
-  // option says to start the config app Or a SELECT button is (or was) pressed
-  // to start the configuration section of the app
-
-  // In this example, the flow will always start the configuration app first
-  // The ROM Emulator app for example will check here if the start directly
-  // in emulation mode is needed or not
-
-  // 3. If we are here, it means the app is not in emulation mode, but in
-  // setup/configuration mode
-
-  // As a rule of thumb, the remote device (the computer) driver code must
-  // be copied to the RAM of the host device where the emulation will take
-  // place.
-  // The code is stored as an array in the target_firmware.h file
-  //
-  // Copy the terminal firmware to RAM
-  COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length);
-
-  // Initialize the terminal emulator PIO programs
-  // The communication between the remote (target) computer and the RP2040 is
-  // done using a command protocol over the cartridge bus
-  // term_dma_irq_handler_lookup is the implementation of the terminal emulator
-  // using the command protocol.
-  // Hence, if you want to implement your own app or microfirmware, you should
-  // implement your own command handler using this protocol.
-  init_romemul(NULL, term_dma_irq_handler_lookup, false);
-
-  // After this point, the remote computer can execute the code
-
-  // 4. During the setup/configuration mode, the driver code must interact
-  // with the user to configure the device. To simplify the process, the
-  // terminal emulator is used to interact with the user.
-  // The terminal emulator is a simple text-based interface that allows the
-  // user to configure the device using text commands.
-  // If you want to use a custom app in the remote computer, you can do it.
-  // But it's easier to debug and code in the rp2040
-
-  // Initialize the display
-  display_setupU8g2();
-
-  // 5. Init the sd card
-  // Most of the apps or microfirmwares will need to read and write files
-  // to the SD card. The SD card is used to store the ROM, floppies, even
-  // full hard disk files, configuration files, and other data.
-  // The SD card is initialized here. If the SD card is not present, the
-  // app continues and reports SD status in the terminal menu.
-  // Each app or microfirmware must have a folder in the SD card where the
-  // files are stored. The folder name is defined in the configuration.
-  // If there is no folder in the micro SD card, the app will create it.
-
-  FATFS fsys;
-  SettingsConfigEntry *folder =
-      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
-  char *folderName = "/test";  // MODIFY THIS TO YOUR FOLDER NAME
-  if (folder == NULL) {
-    DPRINTF("FOLDER not found in the configuration. Using default value\n");
-  } else {
-    DPRINTF("FOLDER: %s\n", folder->value);
-    folderName = folder->value;
-  }
-  int sdcardErr = sdcard_initFilesystem(&fsys, folderName);
-  if (sdcardErr != SDCARD_INIT_OK) {
-    DPRINTF("SD card unavailable (error %i). Continuing without SD.\n", sdcardErr);
-  } else {
-    DPRINTF("SD card found & initialized\n");
-  }
-
-  // Initialize the display again (in case the terminal emulator changed it)
-  display_setupU8g2();
-
-  // Pre-init the stuff
-  // In this example it only prints the please wait message, but can be used as
-  // a place to put other code that needs to be run before the network is
-  // initialized
-  preinit();
-
-  // 6. Init the network, if needed
-  // It's always a good idea to wait for the network to be ready
-  // Get the WiFi mode from the settings
-  // If you are developing code that does not use the network, you can
-  // comment this section
-  // It's important to note that the network parameters are taken from the
-  // global configuration of the Booster app. The network parameters are
-  // ready only for the microfirmware apps.
-  SettingsConfigEntry *wifiMode =
-      settings_find_entry(gconfig_getContext(), PARAM_WIFI_MODE);
-  wifi_mode_t wifiModeValue = WIFI_MODE_STA;
-  if (wifiMode == NULL) {
-    DPRINTF("No WiFi mode found in the settings. No initializing.\n");
-  } else {
-    wifiModeValue = (wifi_mode_t)atoi(wifiMode->value);
-    if (wifiModeValue != WIFI_MODE_AP) {
-      DPRINTF("WiFi mode is STA\n");
-      wifiModeValue = WIFI_MODE_STA;
-      int err = network_wifiInit(wifiModeValue);
-      if (err != 0) {
-        DPRINTF("Error initializing the network: %i. No initializing.\n", err);
-      } else {
-        // Set the term_loop as a callback during the polling period
-        network_setPollingCallback(term_loop);
-        // Connect to the WiFi network
-        int maxAttempts = 3;  // or any other number defined elsewhere
-        int attempt = 0;
-        err = NETWORK_WIFI_STA_CONN_ERR_TIMEOUT;
-
-        while ((attempt < maxAttempts) &&
-               (err == NETWORK_WIFI_STA_CONN_ERR_TIMEOUT)) {
-          err = network_wifiStaConnect();
-          attempt++;
-
-          if ((err > 0) && (err < NETWORK_WIFI_STA_CONN_ERR_TIMEOUT)) {
-            DPRINTF("Error connecting to the WiFi network: %i\n", err);
-          }
+    /* Split boxes until we have 16 */
+    while (num_boxes < 16) {
+        /* Find the box with the largest range */
+        int split_box = 0;
+        int max_range = 0;
+        for (int bi = 0; bi < num_boxes; bi++) {
+            MedianBox *bx = &boxes[bi];
+            int rr = bx->r_max - bx->r_min;
+            int gr = bx->g_max - bx->g_min;
+            int br = bx->b_max - bx->b_min;
+            int range = (rr > gr) ? ((rr > br) ? rr : br)
+                                  : ((gr > br) ? gr : br);
+            if (range > max_range) { max_range = range; split_box = bi; }
         }
 
-        if (err == NETWORK_WIFI_STA_CONN_ERR_TIMEOUT) {
-          DPRINTF("Timeout connecting to the WiFi network after %d attempts\n",
-                  maxAttempts);
-          // Optionally, return an error code here.
+        if (max_range == 0) break;  /* all boxes are uniform */
+
+        MedianBox *src = &boxes[split_box];
+        int rr = src->r_max - src->r_min;
+        int gr = src->g_max - src->g_min;
+        int br = src->b_max - src->b_min;
+
+        /* Sort src->indices by the widest channel using insertion sort */
+        int axis = (rr >= gr && rr >= br) ? 0 : (gr >= br) ? 1 : 2;
+        for (int i = 1; i < src->count; i++) {
+            uint8_t key_idx = src->indices[i];
+            uint8_t key_val = rgb768[key_idx*3 + axis];
+            int j = i - 1;
+            while (j >= 0 && rgb768[src->indices[j]*3 + axis] > key_val) {
+                src->indices[j+1] = src->indices[j];
+                j--;
+            }
+            src->indices[j+1] = key_idx;
         }
-        network_setPollingCallback(NULL);
-      }
-    } else {
-      DPRINTF("WiFi mode is AP. No initializing.\n");
+
+        /* Split at the median */
+        int mid = src->count / 2;
+        MedianBox *new_box = &boxes[num_boxes++];
+        new_box->count = 0;
+
+        /* Move second half into new box */
+        new_box->r_min = 255; new_box->r_max = 0;
+        new_box->g_min = 255; new_box->g_max = 0;
+        new_box->b_min = 255; new_box->b_max = 0;
+        for (int i = mid; i < src->count; i++) {
+            uint8_t idx = src->indices[i];
+            uint8_t r = rgb768[idx*3 + 0];
+            uint8_t g = rgb768[idx*3 + 1];
+            uint8_t b = rgb768[idx*3 + 2];
+            if (r < new_box->r_min) new_box->r_min = r;
+            if (r > new_box->r_max) new_box->r_max = r;
+            if (g < new_box->g_min) new_box->g_min = g;
+            if (g > new_box->g_max) new_box->g_max = g;
+            if (b < new_box->b_min) new_box->b_min = b;
+            if (b > new_box->b_max) new_box->b_max = b;
+            new_box->indices[new_box->count++] = idx;
+        }
+
+        /* Recompute src box range for the first half */
+        src->count = mid;
+        src->r_min = 255; src->r_max = 0;
+        src->g_min = 255; src->g_max = 0;
+        src->b_min = 255; src->b_max = 0;
+        for (int i = 0; i < src->count; i++) {
+            uint8_t idx = src->indices[i];
+            uint8_t r = rgb768[idx*3 + 0];
+            uint8_t g = rgb768[idx*3 + 1];
+            uint8_t b = rgb768[idx*3 + 2];
+            if (r < src->r_min) src->r_min = r;
+            if (r > src->r_max) src->r_max = r;
+            if (g < src->g_min) src->g_min = g;
+            if (g > src->g_max) src->g_max = g;
+            if (b < src->b_min) src->b_min = b;
+            if (b > src->b_max) src->b_max = b;
+        }
     }
-  }
 
-  // 7. Configure the SELECT button so menu status can show it immediately.
-  select_configure();
-
-  // 8. Now complete the terminal emulator initialization
-  // The terminal emulator is used to interact with the user to configure the
-  // device.
-  init();
-
-  // Blink on
-#ifdef BLINK_H
-  blink_on();
-#endif
-
-  // 9. Start the main loop
-  // The main loop is the core of the app. It is responsible for running the
-  // app, handling the user input, and performing the tasks of the app.
-  // The main loop runs until the user decides to exit.
-  // For testing purposes, this app only shows commands to manage the settings
-  DPRINTF("Start the app loop here\n");
-  while (getKeepActive()) {
-#if PICO_CYW43_ARCH_POLL
-    network_safePoll();
-    cyw43_arch_wait_for_work_until(make_timeout_time_ms(SLEEP_LOOP_MS));
-#else
-    sleep_ms(SLEEP_LOOP_MS);
-#endif
-    // Check remote commands
-    term_loop();
-
-    if (menuScreenActive) {
-      char *input = term_getInputBuffer();
-      bool hasPendingInput = (input != NULL) && (input[0] != '\0');
-      if (!hasPendingInput &&
-          (absolute_time_diff_us(get_absolute_time(), menuRefreshTime) <= 0)) {
-        term_refreshMenuLiveInfo();
-        menuRefreshTime = make_timeout_time_ms(MENU_REFRESH_TIME_MS);
-      }
+    /* Compute representative colour for each box (average) */
+    uint8_t rep_r[16], rep_g[16], rep_b[16];
+    for (int bi = 0; bi < num_boxes; bi++) {
+        MedianBox *bx = &boxes[bi];
+        uint32_t sum_r = 0, sum_g = 0, sum_b = 0;
+        for (int i = 0; i < bx->count; i++) {
+            uint8_t idx = bx->indices[i];
+            sum_r += rgb768[idx*3 + 0];
+            sum_g += rgb768[idx*3 + 1];
+            sum_b += rgb768[idx*3 + 2];
+        }
+        int cnt = bx->count > 0 ? bx->count : 1;
+        rep_r[bi] = (uint8_t)(sum_r / cnt);
+        rep_g[bi] = (uint8_t)(sum_g / cnt);
+        rep_b[bi] = (uint8_t)(sum_b / cnt);
     }
-  }
+    /* Pad unused boxes with black */
+    for (int bi = num_boxes; bi < 16; bi++) {
+        rep_r[bi] = rep_g[bi] = rep_b[bi] = 0;
+    }
 
-  // 10. Send RESET computer command
-  // Ok, so we are done with the setup but we want to reset the computer to
-  // reboot in the same microfirmware app or start the booster app
+    /* Convert to STE format (4 bits per channel) and store */
+    for (int i = 0; i < 16; i++) {
+        uint8_t r4 = rep_r[i] >> 4;
+        uint8_t g4 = rep_g[i] >> 4;
+        uint8_t b4 = rep_b[i] >> 4;
+        hw_pal_out[i] = (uint16_t)((r4 << 8) | (g4 << 4) | b4);
+    }
 
-  sleep_ms(SLEEP_LOOP_MS);
-  // We must reset the computer
-  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
-  sleep_ms(SLEEP_LOOP_MS);
-  if (getResetDevice()) {
-    // Reset the device
-    reset_device();
-  } else {
-    // Before jumping to the booster app, let's clean the settings
-    // Set emulation mode to 255 (setup menu)
-    settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
-                         APP_MODE_SETUP);
-    settings_save(aconfig_getContext(), true);
+    /* Build pal_map: nearest representative for each of the 256 input colors */
+    for (int i = 0; i < 256; i++) {
+        uint8_t r = rgb768[i*3 + 0];
+        uint8_t g = rgb768[i*3 + 1];
+        uint8_t b = rgb768[i*3 + 2];
+        int best = 0, best_d = 0x7FFFFFFF;
+        for (int j = 0; j < num_boxes; j++) {
+            int d = rgb_dist2(r, g, b, rep_r[j], rep_g[j], rep_b[j]);
+            if (d < best_d) { best_d = d; best = j; }
+        }
+        pal_map_out[i] = (uint8_t)best;
+    }
+}
 
-    // Jump to the booster app
-    DPRINTF("Jumping to the booster app...\n");
-    reset_jump_to_booster();
-  }
+/* =========================================================================
+ * C2P: chunky (8bpp, already pal_map-indexed to 4-bit values) → ST planar
+ *
+ * ST low-res planar layout: for each row, 4 interleaved bitplane words per
+ * 16-pixel block.  Pixel p occupies bit (15 - p%16) of each plane word.
+ * Plane 0 = LSB, plane 3 = MSB of the 4-bit palette index.
+ * ========================================================================= */
+static void sdl_c2p(const uint8_t *chunky, uint16_t *planar,
+                    uint16_t w, uint16_t h) {
+    int blocks_per_row = w / 16;
+    for (int y = 0; y < h; y++) {
+        const uint8_t *row = chunky + y * w;
+        uint16_t *prow = planar + y * blocks_per_row * 4;
+        for (int blk = 0; blk < blocks_per_row; blk++) {
+            uint16_t p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+            for (int px = 0; px < 16; px++) {
+                uint8_t mapped = sdl_md_pal_map[row[blk*16 + px]];
+                uint16_t bit = (uint16_t)(1u << (15 - px));
+                if (mapped & 1) p0 |= bit;
+                if (mapped & 2) p1 |= bit;
+                if (mapped & 4) p2 |= bit;
+                if (mapped & 8) p3 |= bit;
+            }
+            prow[blk*4 + 0] = p0;
+            prow[blk*4 + 1] = p1;
+            prow[blk*4 + 2] = p2;
+            prow[blk*4 + 3] = p3;
+        }
+    }
+}
+
+/* Partial C2P for UPDATE_RECT — clips to 16-pixel column boundaries */
+static void sdl_c2p_rect(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh) {
+    uint16_t x1 = x & ~15u;
+    uint16_t x2 = (uint16_t)((x + rw + 15u) & ~15u);
+    if (x2 > sdl_md_width) x2 = (uint16_t)(sdl_md_width & ~15u);
+    if (y + rh > sdl_md_height) rh = (uint16_t)(sdl_md_height - y);
+
+    int blocks_per_row = sdl_md_width / 16;
+    int blk_start = x1 / 16;
+    int blk_end   = x2 / 16;
+    uint16_t *planar = (uint16_t *)mem_framebuffer_addr;
+
+    for (int row = y; row < y + rh; row++) {
+        const uint8_t *src = sdl_md_chunky + row * sdl_md_width;
+        uint16_t *prow = planar + row * blocks_per_row * 4;
+        for (int blk = blk_start; blk < blk_end; blk++) {
+            uint16_t p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+            for (int px = 0; px < 16; px++) {
+                uint8_t mapped = sdl_md_pal_map[src[blk*16 + px]];
+                uint16_t bit = (uint16_t)(1u << (15 - px));
+                if (mapped & 1) p0 |= bit;
+                if (mapped & 2) p1 |= bit;
+                if (mapped & 4) p2 |= bit;
+                if (mapped & 8) p3 |= bit;
+            }
+            prow[blk*4 + 0] = p0;
+            prow[blk*4 + 1] = p1;
+            prow[blk*4 + 2] = p2;
+            prow[blk*4 + 3] = p3;
+        }
+    }
+}
+
+/* =========================================================================
+ * Command handlers
+ * ========================================================================= */
+
+static void cmd_init(const TransmissionProtocol *proto) {
+    const uint16_t *payload = (const uint16_t *)proto->payload;
+    /* Skip 2 words (random token low/high) */
+    uint32_t d3 = TPROTO_GET_PAYLOAD_PARAM32(payload + 2);
+    uint32_t d4 = TPROTO_GET_PAYLOAD_PARAM32(payload + 4);
+    sdl_md_width  = (uint16_t)(d3 >> 16);
+    sdl_md_height = (uint16_t)(d3 & 0xFFFFu);
+    sdl_md_bpp    = (uint8_t)(d4 >> 16);
+    memset(sdl_md_chunky, 0, SDL_MD_CHUNKY_SIZE);
+    init_default_palette();
+    write_palette_return();
+    DPRINTF("SDL_MD_INIT: %ux%u bpp=%u\n", sdl_md_width, sdl_md_height, sdl_md_bpp);
+}
+
+static void cmd_quit(const TransmissionProtocol *proto) {
+    (void)proto;
+    memset(sdl_md_chunky, 0, SDL_MD_CHUNKY_SIZE);
+    memset((void *)mem_framebuffer_addr, 0, 32000);
+    init_default_palette();
+    DPRINTF("SDL_MD_QUIT\n");
+}
+
+static void cmd_set_palette(const TransmissionProtocol *proto) {
+    /* Inline RGB buffer starts at byte offset 16 (after token+d3+d4+d5) */
+    const uint8_t *rgb = proto->payload + 16;
+    uint16_t available = proto->payload_size > 16
+                         ? (uint16_t)(proto->payload_size - 16) : 0;
+    if (available < 768) {
+        DPRINTF("SDL_MD_SET_PALETTE: short payload (%u)\n", available);
+        return;
+    }
+    median_cut(rgb, sdl_md_hw_pal, sdl_md_pal_map);
+    write_palette_return();
+    DPRINTF("SDL_MD_SET_PALETTE: done\n");
+}
+
+static void cmd_blit_surface(const TransmissionProtocol *proto) {
+    const uint16_t *payload = (const uint16_t *)proto->payload;
+    uint32_t d3 = TPROTO_GET_PAYLOAD_PARAM32(payload + 2);
+    uint32_t d4 = TPROTO_GET_PAYLOAD_PARAM32(payload + 4);
+    uint32_t d5 = TPROTO_GET_PAYLOAD_PARAM32(payload + 6);
+
+    uint16_t x        = (uint16_t)(d3 >> 16);
+    uint16_t y        = (uint16_t)(d3 & 0xFFFFu);
+    uint16_t bw       = (uint16_t)(d4 >> 16);
+    uint16_t bh       = (uint16_t)(d4 & 0xFFFFu);
+    uint16_t srcpitch = (uint16_t)(d5 >> 16);
+
+    const uint8_t *src = proto->payload + 16;
+    if (srcpitch == 0) srcpitch = bw;
+
+    for (int row = 0; row < bh; row++) {
+        uint32_t dst_offset = (uint32_t)(y + row) * sdl_md_width + x;
+        if (dst_offset + bw > SDL_MD_CHUNKY_SIZE) break;
+        memcpy(&sdl_md_chunky[dst_offset], src + row * srcpitch, bw);
+    }
+}
+
+static void cmd_fill_rect(const TransmissionProtocol *proto) {
+    const uint16_t *payload = (const uint16_t *)proto->payload;
+    uint32_t d3 = TPROTO_GET_PAYLOAD_PARAM32(payload + 2);
+    uint32_t d4 = TPROTO_GET_PAYLOAD_PARAM32(payload + 4);
+    uint32_t d5 = TPROTO_GET_PAYLOAD_PARAM32(payload + 6);
+
+    uint16_t x  = (uint16_t)(d3 >> 16);
+    uint16_t y  = (uint16_t)(d3 & 0xFFFFu);
+    uint16_t fw = (uint16_t)(d4 >> 16);
+    uint16_t fh = (uint16_t)(d4 & 0xFFFFu);
+    uint8_t  color = (uint8_t)(d5 >> 16);
+
+    for (int row = y; row < y + fh && row < sdl_md_height; row++) {
+        uint32_t dst_offset = (uint32_t)row * sdl_md_width + x;
+        uint16_t len = fw;
+        if (x + len > sdl_md_width) len = (uint16_t)(sdl_md_width - x);
+        memset(&sdl_md_chunky[dst_offset], color, len);
+    }
+}
+
+static void cmd_flip(const TransmissionProtocol *proto) {
+    (void)proto;
+    sdl_c2p(sdl_md_chunky, (uint16_t *)mem_framebuffer_addr,
+            sdl_md_width, sdl_md_height);
+    DPRINTF("SDL_MD_FLIP\n");
+}
+
+static void cmd_update_rect(const TransmissionProtocol *proto) {
+    const uint16_t *payload = (const uint16_t *)proto->payload;
+    uint32_t d3 = TPROTO_GET_PAYLOAD_PARAM32(payload + 2);
+    uint32_t d4 = TPROTO_GET_PAYLOAD_PARAM32(payload + 4);
+    uint16_t x  = (uint16_t)(d3 >> 16);
+    uint16_t y  = (uint16_t)(d3 & 0xFFFFu);
+    uint16_t rw = (uint16_t)(d4 >> 16);
+    uint16_t rh = (uint16_t)(d4 & 0xFFFFu);
+    sdl_c2p_rect(x, y, rw, rh);
+}
+
+static void cmd_ping(const TransmissionProtocol *proto) {
+    const uint16_t *payload = (const uint16_t *)proto->payload;
+    uint32_t d3 = TPROTO_GET_PAYLOAD_PARAM32(payload + 2);
+    if (d3 == SDL_MD_PING_MAGIC) {
+        /* Write the magic directly as the token so the ST can verify it */
+        TPROTO_SET_RANDOM_TOKEN(mem_random_token_addr, SDL_MD_PING_MAGIC);
+    }
+    /* Suppress normal token write below by returning early.
+     * The token was already written above. */
+    (void)d3;
+}
+
+/* =========================================================================
+ * Protocol DMA IRQ handler (runs in RAM, called from DMA IRQ1)
+ * ========================================================================= */
+static inline void __not_in_flash_func(handle_sdl_command)(
+    const TransmissionProtocol *protocol) {
+    uint8_t write_idx = protocol_write_index;
+    TransmissionProtocol *wbuf = &protocol_buffers[write_idx];
+
+    wbuf->command_id     = protocol->command_id;
+    wbuf->payload_size   = protocol->payload_size;
+    wbuf->bytes_read     = protocol->bytes_read;
+    wbuf->final_checksum = protocol->final_checksum;
+
+    uint16_t size = protocol->payload_size;
+    if (size > MAX_PROTOCOL_PAYLOAD_SIZE) size = MAX_PROTOCOL_PAYLOAD_SIZE;
+    memcpy(wbuf->payload, protocol->payload, size);
+
+    uint8_t read_idx = protocol_read_index;
+    protocol_read_index  = write_idx;
+    protocol_write_index = read_idx;
+    protocol_buffer_ready = true;
+}
+
+static inline void __not_in_flash_func(handle_sdl_checksum_error)(
+    const TransmissionProtocol *protocol) {
+    DPRINTF("SDL checksum error (ID=%u, Size=%u)\n",
+            protocol->command_id, protocol->payload_size);
+}
+
+void __not_in_flash_func(sdl_md_dma_irq_handler_lookup)(void) {
+    int lookup_ch = romemul_getLookupDataRomDmaChannel();
+    if ((lookup_ch < 0) || (lookup_ch >= NUM_DMA_CHANNELS)) return;
+
+    dma_hw->ints1 = 1u << (uint)lookup_ch;
+    uint32_t addr = dma_hw->ch[(uint)lookup_ch].al3_read_addr_trig;
+
+    if (__builtin_expect(addr & 0x00010000u, 0)) {
+        uint16_t addr_lsb = (uint16_t)(addr ^ ADDRESS_HIGH_BIT);
+        tprotocol_parse(addr_lsb, handle_sdl_command, handle_sdl_checksum_error);
+    }
+}
+
+/* =========================================================================
+ * Command dispatcher
+ * ========================================================================= */
+static void sdl_dispatch(const TransmissionProtocol *proto) {
+    /* Extract the random token from the payload (first 4 bytes) so we can
+     * echo it back to the ST after the command completes. */
+    const uint16_t *payload = (const uint16_t *)proto->payload;
+    uint32_t token = TPROTO_GET_RANDOM_TOKEN(payload);
+
+    bool ping = false;
+    switch (proto->command_id) {
+        case SDL_MD_INIT:         cmd_init(proto);         break;
+        case SDL_MD_QUIT:         cmd_quit(proto);         break;
+        case SDL_MD_SET_PALETTE:  cmd_set_palette(proto);  break;
+        case SDL_MD_BLIT_SURFACE: cmd_blit_surface(proto); break;
+        case SDL_MD_FILL_RECT:    cmd_fill_rect(proto);    break;
+        case SDL_MD_FLIP:         cmd_flip(proto);         break;
+        case SDL_MD_UPDATE_RECT:  cmd_update_rect(proto);  break;
+        case SDL_MD_PING:
+            cmd_ping(proto);
+            ping = true;
+            break;
+        default:
+            DPRINTF("SDL unknown command: %u\n", proto->command_id);
+            break;
+    }
+
+    /* PING writes its own token; all other commands echo the ST's token */
+    if (!ping) {
+        TPROTO_SET_RANDOM_TOKEN(mem_random_token_addr, token);
+    }
+}
+
+/* =========================================================================
+ * emul_start — firmware entry point called from main.c
+ * ========================================================================= */
+void emul_start(void) {
+    /* Compute sub-addresses within the ST-visible ROM4 window */
+    uint32_t rom_base = (uint32_t)&__rom_in_ram_start__;
+    mem_framebuffer_addr   = rom_base + SDL_MD_FRAMEBUFFER_OFFSET;
+    mem_random_token_addr  = rom_base + SDL_MD_RANDOM_TOKEN_OFFSET;
+    mem_palette_return_addr = rom_base + SDL_MD_PALETTE_RETURN_OFFSET;
+
+    /* Initialise default EGA palette */
+    init_default_palette();
+    write_palette_return();
+
+    /* Copy the ST-side boot stub into ROM_IN_RAM */
+    COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length);
+
+    /* Render the boot message into the framebuffer at $FA8000.
+     * display_setupU8g2() points u8g2 directly at ROM_IN_RAM + 0x8000, which
+     * is the same region the ST's main.s copies to screen memory every vsync.
+     * The message is therefore visible on the ST as soon as the bus is live. */
+    display_setupU8g2();
+    u8g2_t *u8g2 = display_getU8g2Ref();
+    u8g2_ClearBuffer(u8g2);
+    u8g2_SetFont(u8g2, u8g2_font_squeezed_b7_tr);
+    u8g2_DrawStr(u8g2, 4, 12, "MD/SDL: SDL coprocessor is ready");
+    u8g2_SendBuffer(u8g2);
+
+    /* Start the cartridge bus emulator with our DMA IRQ handler */
+    init_romemul(NULL, sdl_md_dma_irq_handler_lookup, false);
+
+    DPRINTF("MD/SDL: ready, waiting for commands\n");
+
+    /* Main command loop */
+    while (true) {
+        bool ready = false;
+        TransmissionProtocol snapshot;
+
+        uint32_t irq_state = save_and_disable_interrupts();
+        if (protocol_buffer_ready) {
+            snapshot = protocol_buffers[protocol_read_index];
+            protocol_buffer_ready = false;
+            ready = true;
+        }
+        restore_interrupts(irq_state);
+
+        if (ready) {
+            sdl_dispatch(&snapshot);
+        }
+    }
 }

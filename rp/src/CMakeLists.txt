@@ -107,16 +107,13 @@ target_sources(${PROJECT_NAME} PRIVATE
         blink.c
         display.c
         display_term.c
-        download.c
         emul.c
         gconfig.c
         hw_config.c
-        network.c
         reset.c
         romemul.c
         sdcard.c
         select.c
-        term.c
         tprotocol.c
         settings/settings.c)
 
@@ -130,7 +127,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     no-OS-FatFS-SD-SDIO-SPI-RPi-Pico                # FATFS library   
     pico_stdlib              # Core functionality
     pico_multicore          # Multicore support
-    httpc                    # HTTP client
     settings                 # Custom settings library
     u8g2                     # for display
 )
@@ -186,7 +182,7 @@ if(NOT RELEASE_VERSION)
 
     # In case version.txt is empty or does not exist, use a default version
     if("${RELEASE_VERSION}" STREQUAL "")
-        set(RELEASE_VERSION "v0.0.1dev")
+        set(RELEASE_VERSION "v0.1.0dev")
     endif()
 endif()
 

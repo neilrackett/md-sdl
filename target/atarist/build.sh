@@ -51,7 +51,7 @@ fi
 echo "File has been resized."
 
 echo "Creating the firmware.h file."
-python firmware.py --input=dist/FIRMWARE.IMG --output=$target_firmware --array_name=target_firmware
+python3 firmware.py --input=dist/FIRMWARE.IMG --output=$target_firmware --array_name=target_firmware
 
 cp $target_firmware ../../rp/src/include/$target_firmware
 echo "Copied $target_firmware to rp/src/include/$target_firmware"
