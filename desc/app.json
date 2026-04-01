@@ -1,10 +1,15 @@
 {
   "uuid": "<APP_UUID>",
-  "name": "APP DEV Template",
-  "description": "Microfirmware Application Template for Atari ST",
+  "name": "MD/SDL",
+  "description": "SDL coprocessor for Atari ST",
   "image": "https://placehold.co/256x256/png",
   "tags": [
-    "Sample",
+    "SDL",
+    "Coprocessor",
+    "C2P",
+    "Games",
+    "Graphics",
+    "XBIOS"
   ],
   "devices": [
     "Atari ST",

@@ -112,16 +112,10 @@ static void build_pal_map(const uint8_t *rgb768) {
 
 static void init_default_palette(void) {
     memcpy(sdl_md_hw_pal, ega_palette, sizeof(ega_palette));
-
-    /* Build a synthetic "all-indices" rgb table from EGA colors for pal_map */
-    uint8_t rgb[768];
+    /* EGA palette: index i maps to hardware entry i mod 16 */
     for (int i = 0; i < 256; i++) {
-        uint16_t c = ega_palette[i & 15];
-        rgb[i*3 + 0] = ste_chan_to_8bit((c >> 8) & 0xF);
-        rgb[i*3 + 1] = ste_chan_to_8bit((c >> 4) & 0xF);
-        rgb[i*3 + 2] = ste_chan_to_8bit(c & 0xF);
+        sdl_md_pal_map[i] = (uint8_t)(i & 15);
     }
-    build_pal_map(rgb);
 }
 
 /* Write hw palette to the ST-visible palette return area */
@@ -171,9 +165,7 @@ static void median_cut(const uint8_t *rgb768, uint16_t *hw_pal_out,
         b0->indices[b0->count++] = (uint8_t)i;
     }
 
-    /* Split boxes until we have 16 */
     while (num_boxes < 16) {
-        /* Find the box with the largest range */
         int split_box = 0;
         int max_range = 0;
         for (int bi = 0; bi < num_boxes; bi++) {
@@ -193,7 +185,6 @@ static void median_cut(const uint8_t *rgb768, uint16_t *hw_pal_out,
         int gr = src->g_max - src->g_min;
         int br = src->b_max - src->b_min;
 
-        /* Sort src->indices by the widest channel using insertion sort */
         int axis = (rr >= gr && rr >= br) ? 0 : (gr >= br) ? 1 : 2;
         for (int i = 1; i < src->count; i++) {
             uint8_t key_idx = src->indices[i];
@@ -206,12 +197,9 @@ static void median_cut(const uint8_t *rgb768, uint16_t *hw_pal_out,
             src->indices[j+1] = key_idx;
         }
 
-        /* Split at the median */
         int mid = src->count / 2;
         MedianBox *new_box = &boxes[num_boxes++];
         new_box->count = 0;
-
-        /* Move second half into new box */
         new_box->r_min = 255; new_box->r_max = 0;
         new_box->g_min = 255; new_box->g_max = 0;
         new_box->b_min = 255; new_box->b_max = 0;
@@ -229,7 +217,6 @@ static void median_cut(const uint8_t *rgb768, uint16_t *hw_pal_out,
             new_box->indices[new_box->count++] = idx;
         }
 
-        /* Recompute src box range for the first half */
         src->count = mid;
         src->r_min = 255; src->r_max = 0;
         src->g_min = 255; src->g_max = 0;
@@ -456,15 +443,8 @@ static void cmd_update_rect(const TransmissionProtocol *proto) {
 }
 
 static void cmd_ping(const TransmissionProtocol *proto) {
-    const uint16_t *payload = (const uint16_t *)proto->payload;
-    uint32_t d3 = TPROTO_GET_PAYLOAD_PARAM32(payload + 2);
-    if (d3 == SDL_MD_PING_MAGIC) {
-        /* Write the magic directly as the token so the ST can verify it */
-        TPROTO_SET_RANDOM_TOKEN(mem_random_token_addr, SDL_MD_PING_MAGIC);
-    }
-    /* Suppress normal token write below by returning early.
-     * The token was already written above. */
-    (void)d3;
+    (void)proto;
+    /* Token is echoed by the normal path in sdl_dispatch */
 }
 
 /* =========================================================================
@@ -504,7 +484,7 @@ void __not_in_flash_func(sdl_md_dma_irq_handler_lookup)(void) {
     uint32_t addr = dma_hw->ch[(uint)lookup_ch].al3_read_addr_trig;
 
     if (__builtin_expect(addr & 0x00010000u, 0)) {
-        uint16_t addr_lsb = (uint16_t)(addr ^ ADDRESS_HIGH_BIT);
+        uint16_t addr_lsb = (uint16_t)(addr ^ 0x8000u);
         tprotocol_parse(addr_lsb, handle_sdl_command, handle_sdl_checksum_error);
     }
 }
@@ -518,7 +498,6 @@ static void sdl_dispatch(const TransmissionProtocol *proto) {
     const uint16_t *payload = (const uint16_t *)proto->payload;
     uint32_t token = TPROTO_GET_RANDOM_TOKEN(payload);
 
-    bool ping = false;
     switch (proto->command_id) {
         case SDL_MD_INIT:         cmd_init(proto);         break;
         case SDL_MD_QUIT:         cmd_quit(proto);         break;
@@ -527,19 +506,13 @@ static void sdl_dispatch(const TransmissionProtocol *proto) {
         case SDL_MD_FILL_RECT:    cmd_fill_rect(proto);    break;
         case SDL_MD_FLIP:         cmd_flip(proto);         break;
         case SDL_MD_UPDATE_RECT:  cmd_update_rect(proto);  break;
-        case SDL_MD_PING:
-            cmd_ping(proto);
-            ping = true;
-            break;
+        case SDL_MD_PING:         cmd_ping(proto);         break;
         default:
             DPRINTF("SDL unknown command: %u\n", proto->command_id);
             break;
     }
 
-    /* PING writes its own token; all other commands echo the ST's token */
-    if (!ping) {
-        TPROTO_SET_RANDOM_TOKEN(mem_random_token_addr, token);
-    }
+    TPROTO_SET_RANDOM_TOKEN(mem_random_token_addr, token);
 }
 
 /* =========================================================================
