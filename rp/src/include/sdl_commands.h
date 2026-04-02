@@ -46,7 +46,6 @@
  * Shared state (defined in emul.c)
  * ------------------------------------------------------------------------- */
 extern uint8_t  sdl_md_chunky[SDL_MD_CHUNKY_SIZE];
-extern uint8_t  sdl_md_pal_map[256];
 extern uint16_t sdl_md_hw_pal[16];
 extern uint16_t sdl_md_width;
 extern uint16_t sdl_md_height;

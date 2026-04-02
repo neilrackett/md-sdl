@@ -8,7 +8,18 @@ Welcome to the SDL 1.2 video co-processor for the Atari ST with SidecarTridge Mu
 
 MD/SDL turns the RP2040 inside the SidecarTridge into a graphics co-processor for SDL 1.2 applications — including Doom, Hexen, and Heretic — running on the Atari ST.
 
-The ST maintains a simple 320×200 8bpp chunky pixel surface in RAM. When the application calls `SDL_Flip()`, the ST sends that surface to the RP2040 over the cartridge bus. The RP2040 performs 256→16 colour palette reduction using median cut, converts the result from chunky to ST planar format (C2P), and writes the finished frame directly into the ROM4 window at `$FA8000`. The ST reads it straight back to the screen — no software C2P on the 68000 at all.
+The ST maintains a simple 320×200 8bpp chunky pixel surface in RAM. When the application calls `SDL_Flip()`, the ST sends that surface to the RP2040 over the cartridge bus. The RP2040 performs 256→16 colour palette reduction using median cut, precomputes Bayer-dithered palette mappings, converts the result from chunky to ST planar format (C2P), and writes the finished frame directly into the ROM4 window at `$FA8000`. The ST reads it straight back to the screen — no software C2P on the 68000 at all.
+
+## Progress
+
+The plan is to move as much of SDL's graphics processing to the MD as possible, starting with the most CPU intensive and progressing from there:
+
+✅ Palette handling
+✅ C2P processing
+✅ Bayer dithering
+⬜ Non-blocking (async / parallel) data processing
+⬜ Move the chunky buffer to the RP2040 that doesn't break direct pixel writes
+⬜ A whole bunch of other things
 
 ## How it works
 
@@ -16,9 +27,9 @@ The ST maintains a simple 320×200 8bpp chunky pixel surface in RAM. When the ap
 Atari ST (68000)                          RP2040
 ────────────────                          ──────
 SDL_SetVideoMode()  ──CMD 0x01──►  init chunky surface
-SDL_SetColors()     ──CMD 0x03──►  median cut → 16 colours → $FAF400
+SDL_SetColors()     ──CMD 0x03──►  median cut → Bayer maps → 16 colours → $FAF400
 SDL_Flip()          ──CMD 0x04──►  blit chunky rows (×34 chunks)
-                    ──CMD 0x06──►  C2P → planar frame → $FA8000
+                    ──CMD 0x06──►  Bayer-dithered C2P → planar frame → $FA8000
 ST copies $FA8000   ◄──────────   blitter (STE) or CPU (ST) copies to screen RAM
 Setscreen(screen RAM)              Shifter reads from ST RAM — no ROM4 contention
 ```
@@ -54,7 +65,7 @@ The Atari ST SDL 1.2 driver lives in a separate repository:
 
 ## SDL driver API
 
-MD/SDL integrates transparently into SDL 1.2. No application changes are required — just link against the patched `atarist-sdl` library. The driver is selected automatically when the SidecarTridge is detected.
+MD/SDL integrates transparently into SDL 1.2. No application changes are required — just link against [the patched SDL 1.2 library](https://github.com/neilrackett/atarist-sdl.git). The driver is selected automatically when the SidecarTridge is detected.
 
 ```c
 #include "SDL.h"
@@ -67,7 +78,7 @@ SDL_Surface *screen = SDL_SetVideoMode(320, 200, 8, SDL_HWPALETTE);
 SDL_Flip(screen);   /* uploads chunky surface, triggers C2P on RP2040 */
 ```
 
-`SDL_SetColors()` sends the full 256-entry palette to the RP2040 for median-cut reduction. The 16 resulting hardware colours are applied automatically.
+`SDL_SetColors()` sends the full 256-entry palette to the RP2040 for median-cut reduction. The firmware also precomputes 4×4 Bayer-phase palette maps so `SDL_Flip()` and `SDL_UpdateRects()` can ordered-dither indexed pixels during C2P. The 16 resulting hardware colours are applied automatically.
 
 ## Memory layout
 
@@ -81,16 +92,16 @@ SDL_Flip(screen);   /* uploads chunky surface, triggers C2P on RP2040 */
 
 ## Command reference
 
-| ID   | Name                  | d3                    | d4             | d5               | Inline buf      | RP2040 action                            |
-| ---- | --------------------- | --------------------- | -------------- | ---------------- | --------------- | ---------------------------------------- |
-| 0x01 | `SDL_MD_INIT`         | `(width<<16)\|height` | `(bpp<<16)\|0` | 0                | —               | Clear chunky surface; reset palette      |
-| 0x02 | `SDL_MD_QUIT`         | 0                     | 0              | 0                | —               | Clear chunky surface and palette         |
-| 0x03 | `SDL_MD_SET_PALETTE`  | `(256<<16)\|0`        | 0              | 0                | 768 B (256×RGB) | Median cut → 16 colours; write `$FAF400` |
-| 0x04 | `SDL_MD_BLIT_SURFACE` | `(x<<16)\|y`          | `(w<<16)\|h`   | `(pitch<<16)\|0` | up to 1920 B    | Copy chunky rect into internal surface   |
-| 0x05 | `SDL_MD_FILL_RECT`    | `(x<<16)\|y`          | `(w<<16)\|h`   | `(color<<16)\|0` | —               | Fill rect in chunky surface              |
-| 0x06 | `SDL_MD_FLIP`         | 0                     | 0              | 0                | —               | Apply palette map; C2P → `$FA8000`       |
-| 0x07 | `SDL_MD_UPDATE_RECT`  | `(x<<16)\|y`          | `(w<<16)\|h`   | 0                | —               | Partial C2P of dirty rect only           |
-| 0x08 | `SDL_MD_PING`         | 0                     | 0              | 0                | —               | Echo token (used for detection)          |
+| ID   | Name                  | d3                    | d4             | d5               | Inline buf      | RP2040 action                                         |
+| ---- | --------------------- | --------------------- | -------------- | ---------------- | --------------- | ----------------------------------------------------- |
+| 0x01 | `SDL_MD_INIT`         | `(width<<16)\|height` | `(bpp<<16)\|0` | 0                | —               | Clear chunky surface; reset palette                   |
+| 0x02 | `SDL_MD_QUIT`         | 0                     | 0              | 0                | —               | Clear chunky surface and palette                      |
+| 0x03 | `SDL_MD_SET_PALETTE`  | `(256<<16)\|0`        | 0              | 0                | 768 B (256×RGB) | Median cut + Bayer maps → 16 colours; write `$FAF400` |
+| 0x04 | `SDL_MD_BLIT_SURFACE` | `(x<<16)\|y`          | `(w<<16)\|h`   | `(pitch<<16)\|0` | up to 1920 B    | Copy chunky rect into internal surface                |
+| 0x05 | `SDL_MD_FILL_RECT`    | `(x<<16)\|y`          | `(w<<16)\|h`   | `(color<<16)\|0` | —               | Fill rect in chunky surface                           |
+| 0x06 | `SDL_MD_FLIP`         | 0                     | 0              | 0                | —               | Bayer-dithered C2P → `$FA8000`                        |
+| 0x07 | `SDL_MD_UPDATE_RECT`  | `(x<<16)\|y`          | `(w<<16)\|h`   | 0                | —               | Partial Bayer-dithered C2P of dirty rect              |
+| 0x08 | `SDL_MD_PING`         | 0                     | 0              | 0                | —               | Echo token (used for detection)                       |
 
 A full 320×200 frame upload (`SDL_Flip`) uses 34 `SDL_MD_BLIT_SURFACE` commands (6 rows × 320 B = 1920 B each) followed by one `SDL_MD_FLIP`. A dirty-rect update (`SDL_UpdateRects`) sends only the changed rows via `SDL_MD_BLIT_SURFACE` then uses `SDL_MD_UPDATE_RECT` for the partial C2P (single rect) or `SDL_MD_FLIP` (multiple rects).
 

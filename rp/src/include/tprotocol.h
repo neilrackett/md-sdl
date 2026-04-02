@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "constants.h"
@@ -101,6 +102,8 @@ extern uint32_t tprotocol_last_header_found;
 extern uint32_t tprotocol_new_header_found;
 extern TPParseStep tprotocol_nextTPstep;
 extern TransmissionProtocol tprotocol_transmission;
+extern uint16_t tprotocol_expected_payload_size;
+extern bool tprotocol_payload_overflow;
 
 // --------------------------------------
 // Inline assembly example for storing a 16-bit payload value (ARM).
@@ -147,10 +150,16 @@ static inline __attribute__((always_inline)) void __not_in_flash_func(
 static inline __attribute__((always_inline)) void __not_in_flash_func(
     read_payload_size)(uint16_t data) {
   if (data > 0) {
-    tprotocol_transmission.payload_size = data;
+    tprotocol_expected_payload_size = data;
+    tprotocol_payload_overflow = (data > MAX_PROTOCOL_PAYLOAD_SIZE);
+    tprotocol_transmission.payload_size =
+        tprotocol_payload_overflow ? MAX_PROTOCOL_PAYLOAD_SIZE : data;
     tprotocol_nextTPstep = PAYLOAD_READ_START;
   } else {
     // Zero payload => skip to end
+    tprotocol_expected_payload_size = 0;
+    tprotocol_payload_overflow = false;
+    tprotocol_transmission.payload_size = 0;
     tprotocol_nextTPstep = PAYLOAD_READ_END;
   }
   // Accumulate payload size into final_checksum
@@ -165,15 +174,18 @@ static inline __attribute__((always_inline)) void __not_in_flash_func(
 // --------------------------------------
 static inline __attribute__((always_inline)) void __not_in_flash_func(
     read_payload)(uint16_t data) {
-  // Store the 16-bit chunk into the payload array
-  store_payload_16_asm(
-      data, &tprotocol_transmission.payload[tprotocol_transmission.bytes_read]);
+  // Store only the prefix that fits in the fixed payload buffer, but continue
+  // consuming the full declared payload so the stream stays in sync.
+  if (tprotocol_transmission.bytes_read < tprotocol_transmission.payload_size) {
+    store_payload_16_asm(
+        data, &tprotocol_transmission.payload[tprotocol_transmission.bytes_read]);
+  }
 
   // Accumulate the data into final_checksum
   tprotocol_transmission.final_checksum += data;
 
   tprotocol_transmission.bytes_read += 2;
-  if (tprotocol_transmission.bytes_read >= tprotocol_transmission.payload_size) {
+  if (tprotocol_transmission.bytes_read >= tprotocol_expected_payload_size) {
     tprotocol_nextTPstep = PAYLOAD_READ_END;
   } else {
     tprotocol_nextTPstep = PAYLOAD_READ_INPROGRESS;
@@ -187,6 +199,8 @@ static inline __attribute__((always_inline)) void __not_in_flash_func(
   tprotocol_transmission.bytes_read = 0;
   tprotocol_transmission.payload_size = 0;
   tprotocol_transmission.final_checksum = 0;
+  tprotocol_expected_payload_size = 0;
+  tprotocol_payload_overflow = false;
 }
 
 // This function is called once we finish reading the command + payload
@@ -257,7 +271,8 @@ static inline void __not_in_flash_func(tprotocol_parse)(
       break;
     case PAYLOAD_READ_END:
       // "data" is the checksum
-      if (data == tprotocol_transmission.final_checksum) {
+      if ((data == tprotocol_transmission.final_checksum) &&
+          !tprotocol_payload_overflow) {
         // Checksum matches
         process_command(callback);
       } else {

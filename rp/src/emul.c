@@ -32,11 +32,15 @@
  * Shared surface state (exported via sdl_commands.h)
  * ========================================================================= */
 uint8_t  sdl_md_chunky[SDL_MD_CHUNKY_SIZE];
-uint8_t  sdl_md_pal_map[256];
 uint16_t sdl_md_hw_pal[16];
 uint16_t sdl_md_width  = SDL_MD_MAX_WIDTH;
 uint16_t sdl_md_height = SDL_MD_MAX_HEIGHT;
 uint8_t  sdl_md_bpp    = 8;
+
+#define SDL_MD_BAYER_DIM     4u
+#define SDL_MD_BAYER_PHASES  (SDL_MD_BAYER_DIM * SDL_MD_BAYER_DIM)
+
+static uint8_t sdl_md_bayer_pal_map[SDL_MD_BAYER_PHASES][256];
 
 /* =========================================================================
  * ROM_IN_RAM sub-addresses (computed from __rom_in_ram_start__ at init)
@@ -76,9 +80,22 @@ static const uint16_t ega_palette[16] = {
     0x0FFF,  /* 15 White        */
 };
 
+static const uint8_t bayer4x4[SDL_MD_BAYER_PHASES] = {
+     0,  8,  2, 10,
+    12,  4, 14,  6,
+     3, 11,  1,  9,
+    15,  7, 13,  5,
+};
+
 /* Convert a 4-bit STE channel value (0-15) to 8-bit linear (0-255) */
 static inline uint8_t ste_chan_to_8bit(uint8_t c4) {
     return (uint8_t)((c4 << 4) | c4);
+}
+
+static inline uint8_t clamp_u8(int value) {
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return (uint8_t)value;
 }
 
 /* Squared Euclidean distance in RGB space */
@@ -87,35 +104,86 @@ static inline int rgb_dist2(int r1, int g1, int b1, int r2, int g2, int b2) {
     return dr*dr + dg*dg + db*db;
 }
 
-/* Build pal_map from current hw_pal and a 768-byte RGB source */
-static void build_pal_map(const uint8_t *rgb768) {
-    /* Pre-expand hw_pal to 8-bit RGB for distance calc */
-    uint8_t hr[16], hg[16], hb[16];
-    for (int i = 0; i < 16; i++) {
+static void unpack_hw_palette_rgb(uint8_t *hr, uint8_t *hg, uint8_t *hb,
+                                  uint8_t hw_count) {
+    for (int i = 0; i < hw_count; i++) {
         uint16_t c = sdl_md_hw_pal[i];
         hr[i] = ste_chan_to_8bit((c >> 8) & 0xF);
         hg[i] = ste_chan_to_8bit((c >> 4) & 0xF);
         hb[i] = ste_chan_to_8bit(c & 0xF);
     }
+    for (int i = hw_count; i < 16; i++) {
+        hr[i] = 0;
+        hg[i] = 0;
+        hb[i] = 0;
+    }
+}
+
+static int nearest_hw_color_index(uint8_t r, uint8_t g, uint8_t b,
+                                  const uint8_t *hr, const uint8_t *hg,
+                                  const uint8_t *hb, uint8_t hw_count) {
+    int best = 0;
+    int best_d = 0x7FFFFFFF;
+    for (int j = 0; j < hw_count; j++) {
+        int d = rgb_dist2(r, g, b, hr[j], hg[j], hb[j]);
+        if (d < best_d) {
+            best_d = d;
+            best = j;
+        }
+    }
+    return best;
+}
+
+static void copy_uniform_bayer_pal_map(const uint8_t *base_map) {
+    for (int phase = 0; phase < SDL_MD_BAYER_PHASES; phase++) {
+        memcpy(sdl_md_bayer_pal_map[phase], base_map, 256);
+    }
+}
+
+static void build_bayer_pal_map(const uint8_t *rgb768, uint8_t hw_count) {
+    uint8_t hr[16], hg[16], hb[16];
+    uint8_t base_map[256];
+
+    unpack_hw_palette_rgb(hr, hg, hb, hw_count);
     for (int i = 0; i < 256; i++) {
         uint8_t r = rgb768[i*3 + 0];
         uint8_t g = rgb768[i*3 + 1];
         uint8_t b = rgb768[i*3 + 2];
-        int best = 0, best_d = 0x7FFFFFFF;
-        for (int j = 0; j < 16; j++) {
-            int d = rgb_dist2(r, g, b, hr[j], hg[j], hb[j]);
-            if (d < best_d) { best_d = d; best = j; }
+        base_map[i] = (uint8_t)nearest_hw_color_index(
+            r, g, b, hr, hg, hb, hw_count
+        );
+    }
+
+    for (int phase = 0; phase < SDL_MD_BAYER_PHASES; phase++) {
+        int threshold = ((int)bayer4x4[phase] * 2) - (SDL_MD_BAYER_PHASES - 1);
+        for (int i = 0; i < 256; i++) {
+            int base = base_map[i];
+            int src_r = rgb768[i*3 + 0];
+            int src_g = rgb768[i*3 + 1];
+            int src_b = rgb768[i*3 + 2];
+            int err_r = src_r - hr[base];
+            int err_g = src_g - hg[base];
+            int err_b = src_b - hb[base];
+            uint8_t adj_r = clamp_u8(src_r + ((err_r * threshold) / 16));
+            uint8_t adj_g = clamp_u8(src_g + ((err_g * threshold) / 16));
+            uint8_t adj_b = clamp_u8(src_b + ((err_b * threshold) / 16));
+
+            sdl_md_bayer_pal_map[phase][i] = (uint8_t)nearest_hw_color_index(
+                adj_r, adj_g, adj_b, hr, hg, hb, hw_count
+            );
         }
-        sdl_md_pal_map[i] = (uint8_t)best;
     }
 }
 
 static void init_default_palette(void) {
+    uint8_t base_map[256];
+
     memcpy(sdl_md_hw_pal, ega_palette, sizeof(ega_palette));
     /* EGA palette: index i maps to hardware entry i mod 16 */
     for (int i = 0; i < 256; i++) {
-        sdl_md_pal_map[i] = (uint8_t)(i & 15);
+        base_map[i] = (uint8_t)(i & 15);
     }
+    copy_uniform_bayer_pal_map(base_map);
 }
 
 /* Write hw palette to the ST-visible palette return area */
@@ -129,7 +197,7 @@ static void write_palette_return(void) {
 /* =========================================================================
  * Median-cut palette reduction
  * Input:  rgb768  — 256 × 3 bytes (R, G, B)
- * Output: hw_pal_out[16] in STE format, pal_map_out[256]
+ * Output: hw_pal_out[16] in STE format
  * ========================================================================= */
 
 typedef struct {
@@ -140,8 +208,7 @@ typedef struct {
     int     count;
 } MedianBox;
 
-static void median_cut(const uint8_t *rgb768, uint16_t *hw_pal_out,
-                       uint8_t *pal_map_out) {
+static uint8_t median_cut(const uint8_t *rgb768, uint16_t *hw_pal_out) {
     static MedianBox boxes[16];
     int num_boxes = 1;
 
@@ -264,22 +331,11 @@ static void median_cut(const uint8_t *rgb768, uint16_t *hw_pal_out,
         hw_pal_out[i] = (uint16_t)((r4 << 8) | (g4 << 4) | b4);
     }
 
-    /* Build pal_map: nearest representative for each of the 256 input colors */
-    for (int i = 0; i < 256; i++) {
-        uint8_t r = rgb768[i*3 + 0];
-        uint8_t g = rgb768[i*3 + 1];
-        uint8_t b = rgb768[i*3 + 2];
-        int best = 0, best_d = 0x7FFFFFFF;
-        for (int j = 0; j < num_boxes; j++) {
-            int d = rgb_dist2(r, g, b, rep_r[j], rep_g[j], rep_b[j]);
-            if (d < best_d) { best_d = d; best = j; }
-        }
-        pal_map_out[i] = (uint8_t)best;
-    }
+    return (uint8_t)num_boxes;
 }
 
 /* =========================================================================
- * C2P: chunky (8bpp, already pal_map-indexed to 4-bit values) → ST planar
+ * C2P: chunky (8bpp indices) → ST planar using Bayer-phase palette maps
  *
  * ST low-res planar layout: for each row, 4 interleaved bitplane words per
  * 16-pixel block.  Pixel p occupies bit (15 - p%16) of each plane word.
@@ -289,13 +345,40 @@ static void sdl_c2p(const uint8_t *chunky, uint16_t *planar,
                     uint16_t w, uint16_t h) {
     int blocks_per_row = w / 16;
     for (int y = 0; y < h; y++) {
+        uint8_t row_phase = (uint8_t)((y & (SDL_MD_BAYER_DIM - 1u)) << 2);
+        const uint8_t *map0 = sdl_md_bayer_pal_map[row_phase | 0u];
+        const uint8_t *map1 = sdl_md_bayer_pal_map[row_phase | 1u];
+        const uint8_t *map2 = sdl_md_bayer_pal_map[row_phase | 2u];
+        const uint8_t *map3 = sdl_md_bayer_pal_map[row_phase | 3u];
         const uint8_t *row = chunky + y * w;
         uint16_t *prow = planar + y * blocks_per_row * 4;
         for (int blk = 0; blk < blocks_per_row; blk++) {
             uint16_t p0 = 0, p1 = 0, p2 = 0, p3 = 0;
-            for (int px = 0; px < 16; px++) {
-                uint8_t mapped = sdl_md_pal_map[row[blk*16 + px]];
-                uint16_t bit = (uint16_t)(1u << (15 - px));
+            const uint8_t *src = row + blk * 16;
+            for (int px = 0; px < 16; px += 4) {
+                uint8_t mapped = map0[src[px + 0]];
+                uint16_t bit = (uint16_t)(1u << (15 - (px + 0)));
+                if (mapped & 1) p0 |= bit;
+                if (mapped & 2) p1 |= bit;
+                if (mapped & 4) p2 |= bit;
+                if (mapped & 8) p3 |= bit;
+
+                mapped = map1[src[px + 1]];
+                bit = (uint16_t)(1u << (15 - (px + 1)));
+                if (mapped & 1) p0 |= bit;
+                if (mapped & 2) p1 |= bit;
+                if (mapped & 4) p2 |= bit;
+                if (mapped & 8) p3 |= bit;
+
+                mapped = map2[src[px + 2]];
+                bit = (uint16_t)(1u << (15 - (px + 2)));
+                if (mapped & 1) p0 |= bit;
+                if (mapped & 2) p1 |= bit;
+                if (mapped & 4) p2 |= bit;
+                if (mapped & 8) p3 |= bit;
+
+                mapped = map3[src[px + 3]];
+                bit = (uint16_t)(1u << (15 - (px + 3)));
                 if (mapped & 1) p0 |= bit;
                 if (mapped & 2) p1 |= bit;
                 if (mapped & 4) p2 |= bit;
@@ -311,10 +394,20 @@ static void sdl_c2p(const uint8_t *chunky, uint16_t *planar,
 
 /* Partial C2P for UPDATE_RECT — clips to 16-pixel column boundaries */
 static void sdl_c2p_rect(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh) {
+    if ((rw == 0) || (rh == 0) || (x >= sdl_md_width) || (y >= sdl_md_height)) {
+        return;
+    }
+
     uint16_t x1 = x & ~15u;
-    uint16_t x2 = (uint16_t)((x + rw + 15u) & ~15u);
-    if (x2 > sdl_md_width) x2 = (uint16_t)(sdl_md_width & ~15u);
-    if (y + rh > sdl_md_height) rh = (uint16_t)(sdl_md_height - y);
+    uint16_t x2 = (uint16_t)((((uint32_t)x + rw) + 15u) & ~15u);
+    uint16_t max_x2 = (uint16_t)(sdl_md_width & ~15u);
+    if (x2 > max_x2) x2 = max_x2;
+    if (x1 >= x2) return;
+
+    if (((uint32_t)y + rh) > sdl_md_height) {
+        rh = (uint16_t)(sdl_md_height - y);
+    }
+    if (rh == 0) return;
 
     int blocks_per_row = sdl_md_width / 16;
     int blk_start = x1 / 16;
@@ -322,13 +415,40 @@ static void sdl_c2p_rect(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh) {
     uint16_t *planar = (uint16_t *)mem_framebuffer_addr;
 
     for (int row = y; row < y + rh; row++) {
+        uint8_t row_phase = (uint8_t)((row & (SDL_MD_BAYER_DIM - 1u)) << 2);
+        const uint8_t *map0 = sdl_md_bayer_pal_map[row_phase | 0u];
+        const uint8_t *map1 = sdl_md_bayer_pal_map[row_phase | 1u];
+        const uint8_t *map2 = sdl_md_bayer_pal_map[row_phase | 2u];
+        const uint8_t *map3 = sdl_md_bayer_pal_map[row_phase | 3u];
         const uint8_t *src = sdl_md_chunky + row * sdl_md_width;
         uint16_t *prow = planar + row * blocks_per_row * 4;
         for (int blk = blk_start; blk < blk_end; blk++) {
             uint16_t p0 = 0, p1 = 0, p2 = 0, p3 = 0;
-            for (int px = 0; px < 16; px++) {
-                uint8_t mapped = sdl_md_pal_map[src[blk*16 + px]];
-                uint16_t bit = (uint16_t)(1u << (15 - px));
+            const uint8_t *blk_src = src + blk * 16;
+            for (int px = 0; px < 16; px += 4) {
+                uint8_t mapped = map0[blk_src[px + 0]];
+                uint16_t bit = (uint16_t)(1u << (15 - (px + 0)));
+                if (mapped & 1) p0 |= bit;
+                if (mapped & 2) p1 |= bit;
+                if (mapped & 4) p2 |= bit;
+                if (mapped & 8) p3 |= bit;
+
+                mapped = map1[blk_src[px + 1]];
+                bit = (uint16_t)(1u << (15 - (px + 1)));
+                if (mapped & 1) p0 |= bit;
+                if (mapped & 2) p1 |= bit;
+                if (mapped & 4) p2 |= bit;
+                if (mapped & 8) p3 |= bit;
+
+                mapped = map2[blk_src[px + 2]];
+                bit = (uint16_t)(1u << (15 - (px + 2)));
+                if (mapped & 1) p0 |= bit;
+                if (mapped & 2) p1 |= bit;
+                if (mapped & 4) p2 |= bit;
+                if (mapped & 8) p3 |= bit;
+
+                mapped = map3[blk_src[px + 3]];
+                bit = (uint16_t)(1u << (15 - (px + 3)));
                 if (mapped & 1) p0 |= bit;
                 if (mapped & 2) p1 |= bit;
                 if (mapped & 4) p2 |= bit;
@@ -351,9 +471,22 @@ static void cmd_init(const TransmissionProtocol *proto) {
     /* Skip 2 words (random token low/high) */
     uint32_t d3 = TPROTO_GET_PAYLOAD_PARAM32(payload + 2);
     uint32_t d4 = TPROTO_GET_PAYLOAD_PARAM32(payload + 4);
-    sdl_md_width  = (uint16_t)(d3 >> 16);
-    sdl_md_height = (uint16_t)(d3 & 0xFFFFu);
-    sdl_md_bpp    = (uint8_t)(d4 >> 16);
+    uint16_t width = (uint16_t)(d3 >> 16);
+    uint16_t height = (uint16_t)(d3 & 0xFFFFu);
+    uint8_t bpp = (uint8_t)(d4 >> 16);
+
+    if ((width == 0) || (width > SDL_MD_MAX_WIDTH)) width = SDL_MD_MAX_WIDTH;
+    width = (uint16_t)(width & ~15u);
+    if (width == 0) width = 16;
+
+    if ((height == 0) || (height > SDL_MD_MAX_HEIGHT)) {
+        height = SDL_MD_MAX_HEIGHT;
+    }
+    if (bpp != 8) bpp = 8;
+
+    sdl_md_width  = width;
+    sdl_md_height = height;
+    sdl_md_bpp    = bpp;
     memset(sdl_md_chunky, 0, SDL_MD_CHUNKY_SIZE);
     init_default_palette();
     write_palette_return();
@@ -377,7 +510,8 @@ static void cmd_set_palette(const TransmissionProtocol *proto) {
         DPRINTF("SDL_MD_SET_PALETTE: short payload (%u)\n", available);
         return;
     }
-    median_cut(rgb, sdl_md_hw_pal, sdl_md_pal_map);
+    uint8_t hw_count = median_cut(rgb, sdl_md_hw_pal);
+    build_bayer_pal_map(rgb, hw_count);
     write_palette_return();
     DPRINTF("SDL_MD_SET_PALETTE: done\n");
 }
@@ -395,12 +529,31 @@ static void cmd_blit_surface(const TransmissionProtocol *proto) {
     uint16_t srcpitch = (uint16_t)(d5 >> 16);
 
     const uint8_t *src = proto->payload + 16;
+    uint16_t available = proto->payload_size > 16
+                         ? (uint16_t)(proto->payload_size - 16) : 0;
+    if ((bw == 0) || (bh == 0) || (x >= sdl_md_width) || (y >= sdl_md_height)) {
+        return;
+    }
+
+    if (bw > (sdl_md_width - x)) bw = (uint16_t)(sdl_md_width - x);
+    if (bh > (sdl_md_height - y)) bh = (uint16_t)(sdl_md_height - y);
     if (srcpitch == 0) srcpitch = bw;
+    if (srcpitch < bw) bw = srcpitch;
+    if (bw == 0) return;
 
     for (int row = 0; row < bh; row++) {
+        uint32_t src_offset = (uint32_t)row * srcpitch;
+        if (src_offset >= available) break;
+
+        uint16_t copy_len = bw;
+        if (src_offset + copy_len > available) {
+            copy_len = (uint16_t)(available - src_offset);
+        }
+        if (copy_len == 0) break;
+
         uint32_t dst_offset = (uint32_t)(y + row) * sdl_md_width + x;
-        if (dst_offset + bw > SDL_MD_CHUNKY_SIZE) break;
-        memcpy(&sdl_md_chunky[dst_offset], src + row * srcpitch, bw);
+        if (dst_offset + copy_len > SDL_MD_CHUNKY_SIZE) break;
+        memcpy(&sdl_md_chunky[dst_offset], src + src_offset, copy_len);
     }
 }
 
@@ -416,11 +569,15 @@ static void cmd_fill_rect(const TransmissionProtocol *proto) {
     uint16_t fh = (uint16_t)(d4 & 0xFFFFu);
     uint8_t  color = (uint8_t)(d5 >> 16);
 
+    if ((fw == 0) || (fh == 0) || (x >= sdl_md_width) || (y >= sdl_md_height)) {
+        return;
+    }
+    if (fw > (sdl_md_width - x)) fw = (uint16_t)(sdl_md_width - x);
+    if (fh > (sdl_md_height - y)) fh = (uint16_t)(sdl_md_height - y);
+
     for (int row = y; row < y + fh && row < sdl_md_height; row++) {
         uint32_t dst_offset = (uint32_t)row * sdl_md_width + x;
-        uint16_t len = fw;
-        if (x + len > sdl_md_width) len = (uint16_t)(sdl_md_width - x);
-        memset(&sdl_md_chunky[dst_offset], color, len);
+        memset(&sdl_md_chunky[dst_offset], color, fw);
     }
 }
 
@@ -472,7 +629,7 @@ static inline void __not_in_flash_func(handle_sdl_command)(
 
 static inline void __not_in_flash_func(handle_sdl_checksum_error)(
     const TransmissionProtocol *protocol) {
-    DPRINTF("SDL checksum error (ID=%u, Size=%u)\n",
+    DPRINTF("SDL protocol error (ID=%u, Size=%u)\n",
             protocol->command_id, protocol->payload_size);
 }
 
@@ -544,7 +701,12 @@ void emul_start(void) {
     u8g2_SendBuffer(u8g2);
 
     /* Start the cartridge bus emulator with our DMA IRQ handler */
-    init_romemul(NULL, sdl_md_dma_irq_handler_lookup, false);
+    if (init_romemul(NULL, sdl_md_dma_irq_handler_lookup, false) < 0) {
+        DPRINTF("MD/SDL: ROM emulator init failed\n");
+        while (true) {
+            tight_loop_contents();
+        }
+    }
 
     DPRINTF("MD/SDL: ready, waiting for commands\n");
 

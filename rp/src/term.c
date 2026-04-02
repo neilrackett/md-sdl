@@ -178,7 +178,7 @@ static inline void __not_in_flash_func(handle_protocol_command)(
 
 static inline void __not_in_flash_func(handle_protocol_checksum_error)(
     const TransmissionProtocol *protocol) {
-  DPRINTF("Checksum error detected (ID=%u, Size=%u)\n", protocol->command_id,
+  DPRINTF("Protocol error detected (ID=%u, Size=%u)\n", protocol->command_id,
           protocol->payload_size);
 }
 
