@@ -1,8 +1,10 @@
-# MD/SDL — SDL 1.2 Video Co-processor for the Atari ST
+# MD/SDL: SDL Coprocessor for the Atari ST
 
 Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by [Neil Rackett](https://x.com/neilrackett)
 
 ## Introduction
+
+Welcome to the SDL 1.2 video co-processor for the Atari ST with SidecarTridge Multi-device, or MD/SDL for short.
 
 MD/SDL turns the RP2040 inside the SidecarTridge into a graphics co-processor for SDL 1.2 applications — including Doom, Hexen, and Heretic — running on the Atari ST.
 
@@ -17,8 +19,11 @@ SDL_SetVideoMode()  ──CMD 0x01──►  init chunky surface
 SDL_SetColors()     ──CMD 0x03──►  median cut → 16 colours → $FAF400
 SDL_Flip()          ──CMD 0x04──►  blit chunky rows (×34 chunks)
                     ──CMD 0x06──►  C2P → planar frame → $FA8000
-Setscreen($FA8000)  ◄──────────   ST hardware reads planar frame directly
+ST copies $FA8000   ◄──────────   blitter (STE) or CPU (ST) copies to screen RAM
+Setscreen(screen RAM)              Shifter reads from ST RAM — no ROM4 contention
 ```
+
+Pointing `Setscreen` directly at `$FA8000` (ROM4) causes the Shifter to steal ROM4 bus cycles from the 68000 on every scanline, starving the BLIT_SURFACE commands. The SDL driver copies the finished planar frame to a screen-RAM buffer each frame and points `Setscreen` there instead. On STE the hardware blitter handles the copy in ~1 ms; on plain ST the CPU copy takes ~20 ms but still performs better than continuous Shifter contention.
 
 The palette return area at `$FAF400` contains 16 STE-format `uint16_t` values that are applied via `Setpalette()` after each palette change. The random token at `$FAF000` is polled after every command to synchronise the ST with the RP2040.
 
@@ -66,28 +71,28 @@ SDL_Flip(screen);   /* uploads chunky surface, triggers C2P on RP2040 */
 
 ## Memory layout
 
-| Region | ST address | RP2040 address | Size | Content |
-|---|---|---|---|---|
-| ROM4 window | `$FA0000` | `0x20020000` | 128 KB | ROM-in-RAM |
-| Planar framebuffer | `$FA8000` | `0x20028000` | 32 000 B | C2P output — ST reads directly |
-| Random token | `$FAF000` | `0x2002F000` | 4 B | Completion sync token |
-| Token seed | `$FAF004` | `0x2002F004` | 4 B | Seed for next token |
-| Palette return | `$FAF400` | `0x2002F400` | 32 B | 16 × STE uint16_t hardware colours |
+| Region             | ST address | RP2040 address | Size     | Content                            |
+| ------------------ | ---------- | -------------- | -------- | ---------------------------------- |
+| ROM4 window        | `$FA0000`  | `0x20020000`   | 128 KB   | ROM-in-RAM                         |
+| Planar framebuffer | `$FA8000`  | `0x20028000`   | 32 000 B | C2P output — ST reads directly     |
+| Random token       | `$FAF000`  | `0x2002F000`   | 4 B      | Completion sync token              |
+| Token seed         | `$FAF004`  | `0x2002F004`   | 4 B      | Seed for next token                |
+| Palette return     | `$FAF400`  | `0x2002F400`   | 32 B     | 16 × STE uint16_t hardware colours |
 
 ## Command reference
 
-| ID | Name | d3 | d4 | d5 | Inline buf | RP2040 action |
-|---|---|---|---|---|---|---|
-| 0x01 | `SDL_MD_INIT` | `(width<<16)\|height` | `(bpp<<16)\|0` | 0 | — | Clear chunky surface; reset palette |
-| 0x02 | `SDL_MD_QUIT` | 0 | 0 | 0 | — | Clear chunky surface and palette |
-| 0x03 | `SDL_MD_SET_PALETTE` | `(256<<16)\|0` | 0 | 0 | 768 B (256×RGB) | Median cut → 16 colours; write `$FAF400` |
-| 0x04 | `SDL_MD_BLIT_SURFACE` | `(x<<16)\|y` | `(w<<16)\|h` | `(pitch<<16)\|0` | up to 1920 B | Copy chunky rect into internal surface |
-| 0x05 | `SDL_MD_FILL_RECT` | `(x<<16)\|y` | `(w<<16)\|h` | `(color<<16)\|0` | — | Fill rect in chunky surface |
-| 0x06 | `SDL_MD_FLIP` | 0 | 0 | 0 | — | Apply palette map; C2P → `$FA8000` |
-| 0x07 | `SDL_MD_UPDATE_RECT` | `(x<<16)\|y` | `(w<<16)\|h` | 0 | — | Partial C2P of dirty rect only |
-| 0x08 | `SDL_MD_PING` | 0 | 0 | 0 | — | Echo token (used for detection) |
+| ID   | Name                  | d3                    | d4             | d5               | Inline buf      | RP2040 action                            |
+| ---- | --------------------- | --------------------- | -------------- | ---------------- | --------------- | ---------------------------------------- |
+| 0x01 | `SDL_MD_INIT`         | `(width<<16)\|height` | `(bpp<<16)\|0` | 0                | —               | Clear chunky surface; reset palette      |
+| 0x02 | `SDL_MD_QUIT`         | 0                     | 0              | 0                | —               | Clear chunky surface and palette         |
+| 0x03 | `SDL_MD_SET_PALETTE`  | `(256<<16)\|0`        | 0              | 0                | 768 B (256×RGB) | Median cut → 16 colours; write `$FAF400` |
+| 0x04 | `SDL_MD_BLIT_SURFACE` | `(x<<16)\|y`          | `(w<<16)\|h`   | `(pitch<<16)\|0` | up to 1920 B    | Copy chunky rect into internal surface   |
+| 0x05 | `SDL_MD_FILL_RECT`    | `(x<<16)\|y`          | `(w<<16)\|h`   | `(color<<16)\|0` | —               | Fill rect in chunky surface              |
+| 0x06 | `SDL_MD_FLIP`         | 0                     | 0              | 0                | —               | Apply palette map; C2P → `$FA8000`       |
+| 0x07 | `SDL_MD_UPDATE_RECT`  | `(x<<16)\|y`          | `(w<<16)\|h`   | 0                | —               | Partial C2P of dirty rect only           |
+| 0x08 | `SDL_MD_PING`         | 0                     | 0              | 0                | —               | Echo token (used for detection)          |
 
-A full 320×200 frame upload uses 34 `SDL_MD_BLIT_SURFACE` commands (6 rows × 320 B = 1920 B each) followed by one `SDL_MD_FLIP`.
+A full 320×200 frame upload (`SDL_Flip`) uses 34 `SDL_MD_BLIT_SURFACE` commands (6 rows × 320 B = 1920 B each) followed by one `SDL_MD_FLIP`. A dirty-rect update (`SDL_UpdateRects`) sends only the changed rows via `SDL_MD_BLIT_SURFACE` then uses `SDL_MD_UPDATE_RECT` for the partial C2P (single rect) or `SDL_MD_FLIP` (multiple rects).
 
 ## Build prerequisites
 
@@ -140,10 +145,10 @@ Adjust `PICO_TOOLCHAIN_PATH` to match your installed toolchain version and host 
 
 A successful build produces the following in `dist/`:
 
-| File | Description |
-|---|---|
+| File                    | Description                                   |
+| ----------------------- | --------------------------------------------- |
 | `<UUID>-v<version>.uf2` | RP2040 firmware to flash to the SidecarTridge |
-| `<UUID>.json` | App descriptor with version and MD5 |
+| `<UUID>.json`           | App descriptor with version and MD5           |
 
 ## Flashing
 
@@ -181,14 +186,14 @@ Each command from the ST then appears as `SDL_MD_INIT: 320x200 bpp=8`, `SDL_MD_F
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---|---|
-| `arm-none-eabi-gcc not found` | Set `PICO_TOOLCHAIN_PATH` to the `bin/` directory of your ARM GNU Toolchain install |
-| UF2 not found after build | The RP build failed — scroll up for the first compiler or linker error |
-| ST hangs on first `SDL_Flip()` | UART timeout — confirm the UF2 is flashed and check UART log for `ready, waiting for commands` |
-| Garbled colours | Palette not sent before first flip — ensure `SDL_SetColors()` is called after `SDL_SetVideoMode()` |
-| `stcmd` fails with "not a TTY" | Run with `pty=true` or use the `stcmd` wrapper script |
-| Screen stays black after flip | Check `$FAF000` — if it never matches `expected_token`, the bus sync is failing |
+| Symptom                        | Fix                                                                                                |
+| ------------------------------ | -------------------------------------------------------------------------------------------------- |
+| `arm-none-eabi-gcc not found`  | Set `PICO_TOOLCHAIN_PATH` to the `bin/` directory of your ARM GNU Toolchain install                |
+| UF2 not found after build      | The RP build failed — scroll up for the first compiler or linker error                             |
+| ST hangs on first `SDL_Flip()` | UART timeout — confirm the UF2 is flashed and check UART log for `ready, waiting for commands`     |
+| Garbled colours                | Palette not sent before first flip — ensure `SDL_SetColors()` is called after `SDL_SetVideoMode()` |
+| `stcmd` fails with "not a TTY" | Run with `pty=true` or use the `stcmd` wrapper script                                              |
+| Screen stays black after flip  | Check `$FAF000` — if it never matches `expected_token`, the bus sync is failing                    |
 
 ## License
 

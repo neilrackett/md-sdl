@@ -35,6 +35,8 @@ Use `release` instead of `debug` to disable UART output. A successful build drop
 
 ## 4. Key files
 
+### RP2040 firmware (this repo)
+
 | File | Purpose |
 |---|---|
 | `rp/src/emul.c` | Firmware entry point, command dispatcher, median cut, C2P |
@@ -42,6 +44,15 @@ Use `release` instead of `debug` to disable UART output. A successful build drop
 | `target/atarist/src/main.s` | 68k ROM cartridge header + minimal boot stub |
 | `rp/src/CMakeLists.txt` | RP2040 build configuration |
 | `desc/app.json` | App descriptor template (UUID, name, binary URL, MD5) |
+
+### Atari ST SDL driver (`atarist-sdl` repo, `md-sdl` branch)
+
+| File | Purpose |
+|---|---|
+| `src/video/xbios/SDL_xbios_md.c` | MD/SDL driver: detection, chunky upload, blitter/CPU planar copy, dirty-rect |
+| `src/video/xbios/SDL_xbios.c` | Shared XBIOS lifecycle: calls `SDL_MegaSTE_EnableTurbo/RestoreTurbo` in `VideoInit`/`VideoQuit` |
+| `src/video/ataricommon/SDL_megaste.c` | Mega STE 16 MHz + cache enable/restore (shared across all xbios drivers) |
+| `src/video/ataricommon/SDL_megaste.h` | Header for `SDL_megaste.c`; exports `MCH_MEGA_STE_COOKIE` constant |
 
 ## 5. Command protocol summary
 
@@ -67,6 +78,14 @@ The RP2040 writes the echoed token back to `$FAF000` when done. The ST polls thi
 - `PICO_TOOLCHAIN_PATH` must be exported **before** running `./build.sh` — the rp/build.sh does not set it.
 - Expect harmless linker warnings (`ignoring duplicate libraries: 'errors/liberrors.a'`).
 - The Atari ST build emits "not a TTY" and "Failed to resize the file" — these are from Docker/stcmd and are harmless.
+
+### Shifter DMA contention (why the driver copies to screen RAM)
+
+Pointing `Setscreen` at `$FA8000` (ROM4) causes the Shifter to steal ~800 000 ROM4 reads/second from the 68000 on every scanline, starving the BLIT_SURFACE commands. The driver copies the finished planar frame from `$FA8000` to a screen-RAM buffer each frame and points `Setscreen` at screen RAM. On STE the hardware blitter does the copy in ~1 ms; on plain ST the CPU loop takes ~20 ms but still beats continuous contention. **Never call `Setscreen` with a ROM4 address.**
+
+### Mega STE 16 MHz + cache
+
+`SDL_MegaSTE_EnableTurbo()` / `SDL_MegaSTE_RestoreTurbo()` live in `src/video/ataricommon/SDL_megaste.c` in the `atarist-sdl` repo. They are called from `XBIOS_VideoInit` / `XBIOS_VideoQuit` in `SDL_xbios.c` — **not** from any per-driver `saveMode`/`restoreMode`. This covers all xbios paths (ST, STE, Mega STE with NOVA card, MD, etc.) and is a no-op on non-Mega-STE hardware.
 
 ## 8. Troubleshooting
 
