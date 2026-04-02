@@ -5,8 +5,8 @@
  * The RP2040 acts as a C2P co-processor and framebuffer server.  The Atari ST
  * sends chunky pixel data and palette information over the cartridge bus; the
  * RP2040 performs median-cut palette reduction and chunky-to-planar conversion,
- * then writes the resulting ST low-res planar frame into the ROM4 window at
- * $FA8000 where the ST reads it back directly.
+ * then writes the resulting ST low-res planar frame into one of two ST-visible
+ * ROM4 slots where the ST copies it back into screen RAM.
  */
 
 #include "emul.h"
@@ -22,6 +22,8 @@
 #include "display.h"
 #include "hardware/sync.h"
 #include "memfunc.h"
+#include "pico/critical_section.h"
+#include "pico/multicore.h"
 #include "pico/stdlib.h"
 #include "reset.h"
 #include "romemul.h"
@@ -41,13 +43,48 @@ uint8_t  sdl_md_bpp    = 8;
 #define SDL_MD_BAYER_PHASES  (SDL_MD_BAYER_DIM * SDL_MD_BAYER_DIM)
 
 static uint8_t sdl_md_bayer_pal_map[SDL_MD_BAYER_PHASES][256];
+static uint8_t sdl_md_current_palette_rgb[256 * 3];
+static uint32_t sdl_md_current_palette_seq = 0;
+static uint32_t sdl_md_worker_palette_seq = 0;
+
+typedef enum {
+    SDL_MD_PLANAR_SLOT_FREE = 0,
+    SDL_MD_PLANAR_SLOT_RENDERING = 1,
+    SDL_MD_PLANAR_SLOT_READY = 2,
+} SdlMdPlanarSlotState;
+
+typedef struct {
+    uint32_t seq;
+    uint32_t palette_seq;
+    uint32_t submit_time_us;
+    uint8_t *chunky;
+    uint8_t target_slot;
+    bool full_frame;
+    uint16_t x;
+    uint16_t y;
+    uint16_t rw;
+    uint16_t rh;
+    uint8_t palette_rgb[256 * 3];
+} SdlMdJob;
 
 /* =========================================================================
  * ROM_IN_RAM sub-addresses (computed from __rom_in_ram_start__ at init)
  * ========================================================================= */
-static uint32_t mem_framebuffer_addr;
+static uint32_t mem_framebuffer_addr[SDL_MD_PLANAR_SLOTS];
 static uint32_t mem_random_token_addr;
+static uint32_t mem_random_token_seed_addr;
+static uint32_t mem_mailbox_addr;
 static uint32_t mem_palette_return_addr;
+static uint8_t *sdl_md_chunky_buffers[2];
+static uint8_t sdl_md_upload_chunky_index = 0;
+
+static critical_section_t sdl_md_pipeline_lock;
+static volatile bool sdl_md_worker_launched = false;
+static volatile bool sdl_md_job_pending = false;
+static volatile bool sdl_md_worker_busy = false;
+static SdlMdJob sdl_md_pending_job;
+static volatile uint8_t sdl_md_planar_slot_state[SDL_MD_PLANAR_SLOTS];
+static uint32_t sdl_md_planar_slot_seq[SDL_MD_PLANAR_SLOTS];
 
 /* =========================================================================
  * Protocol double-buffer (same pattern as term.c)
@@ -184,6 +221,39 @@ static void init_default_palette(void) {
         base_map[i] = (uint8_t)(i & 15);
     }
     copy_uniform_bayer_pal_map(base_map);
+}
+
+static void fill_default_palette_rgb(uint8_t *rgb768) {
+    for (int i = 0; i < 256; i++) {
+        uint16_t c = ega_palette[i & 15];
+        rgb768[i * 3 + 0] = ste_chan_to_8bit((c >> 8) & 0xF);
+        rgb768[i * 3 + 1] = ste_chan_to_8bit((c >> 4) & 0xF);
+        rgb768[i * 3 + 2] = ste_chan_to_8bit(c & 0xF);
+    }
+}
+
+static inline SdlMdMailbox *sdl_md_mailbox(void) {
+    return (SdlMdMailbox *)mem_mailbox_addr;
+}
+
+static uint32_t sdl_md_next_token_seed(void) {
+    static uint32_t token_seed = 0x4D44534Cu;
+
+    token_seed ^= token_seed << 13;
+    token_seed ^= token_seed >> 17;
+    token_seed ^= token_seed << 5;
+    if (token_seed == 0) {
+        token_seed = 0x13579BDFu;
+    }
+    return token_seed;
+}
+
+static inline uint32_t sdl_md_now_us(void) {
+    return (uint32_t)to_us_since_boot(get_absolute_time());
+}
+
+static inline uint16_t *sdl_md_planar_ptr(uint8_t slot) {
+    return (uint16_t *)mem_framebuffer_addr[slot];
 }
 
 /* Write hw palette to the ST-visible palette return area */
@@ -393,7 +463,8 @@ static void sdl_c2p(const uint8_t *chunky, uint16_t *planar,
 }
 
 /* Partial C2P for UPDATE_RECT — clips to 16-pixel column boundaries */
-static void sdl_c2p_rect(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh) {
+static void sdl_c2p_rect(const uint8_t *chunky, uint16_t *planar,
+                         uint16_t x, uint16_t y, uint16_t rw, uint16_t rh) {
     if ((rw == 0) || (rh == 0) || (x >= sdl_md_width) || (y >= sdl_md_height)) {
         return;
     }
@@ -412,7 +483,6 @@ static void sdl_c2p_rect(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh) {
     int blocks_per_row = sdl_md_width / 16;
     int blk_start = x1 / 16;
     int blk_end   = x2 / 16;
-    uint16_t *planar = (uint16_t *)mem_framebuffer_addr;
 
     for (int row = y; row < y + rh; row++) {
         uint8_t row_phase = (uint8_t)((row & (SDL_MD_BAYER_DIM - 1u)) << 2);
@@ -420,7 +490,7 @@ static void sdl_c2p_rect(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh) {
         const uint8_t *map1 = sdl_md_bayer_pal_map[row_phase | 1u];
         const uint8_t *map2 = sdl_md_bayer_pal_map[row_phase | 2u];
         const uint8_t *map3 = sdl_md_bayer_pal_map[row_phase | 3u];
-        const uint8_t *src = sdl_md_chunky + row * sdl_md_width;
+        const uint8_t *src = chunky + row * sdl_md_width;
         uint16_t *prow = planar + row * blocks_per_row * 4;
         for (int blk = blk_start; blk < blk_end; blk++) {
             uint16_t p0 = 0, p1 = 0, p2 = 0, p3 = 0;
@@ -462,6 +532,181 @@ static void sdl_c2p_rect(uint16_t x, uint16_t y, uint16_t rw, uint16_t rh) {
     }
 }
 
+static void sdl_md_reset_mailbox(void) {
+    SdlMdMailbox *mailbox = sdl_md_mailbox();
+
+    memset((void *)mailbox, 0, sizeof(*mailbox));
+    mailbox->worker_busy = 0;
+}
+
+static void sdl_md_reset_pipeline_state(void) {
+    critical_section_enter_blocking(&sdl_md_pipeline_lock);
+    sdl_md_job_pending = false;
+    sdl_md_worker_busy = false;
+    sdl_md_upload_chunky_index = 0;
+    for (int i = 0; i < SDL_MD_PLANAR_SLOTS; i++) {
+        sdl_md_planar_slot_state[i] = SDL_MD_PLANAR_SLOT_FREE;
+        sdl_md_planar_slot_seq[i] = 0;
+    }
+    critical_section_exit(&sdl_md_pipeline_lock);
+    sdl_md_reset_mailbox();
+}
+
+static void sdl_md_clear_runtime_buffers(void) {
+    memset(sdl_md_chunky_buffers[0], 0, SDL_MD_CHUNKY_SIZE);
+    memset(sdl_md_chunky_buffers[1], 0, SDL_MD_CHUNKY_SIZE);
+    for (int i = 0; i < SDL_MD_PLANAR_SLOTS; i++) {
+        memset((void *)mem_framebuffer_addr[i], 0, SDL_MD_PLANAR_SIZE);
+    }
+}
+
+static int sdl_md_find_free_planar_slot(void) {
+    for (int i = 0; i < SDL_MD_PLANAR_SLOTS; i++) {
+        if (sdl_md_planar_slot_state[i] == SDL_MD_PLANAR_SLOT_FREE) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int sdl_md_find_latest_ready_slot(void) {
+    int best_slot = -1;
+    uint32_t best_seq = 0;
+
+    for (int i = 0; i < SDL_MD_PLANAR_SLOTS; i++) {
+        if ((sdl_md_planar_slot_state[i] == SDL_MD_PLANAR_SLOT_READY) &&
+            (sdl_md_planar_slot_seq[i] >= best_seq)) {
+            best_seq = sdl_md_planar_slot_seq[i];
+            best_slot = i;
+        }
+    }
+    return best_slot;
+}
+
+static void sdl_md_publish_ready_frame(uint8_t slot, uint32_t seq,
+                                       uint32_t palette_seq,
+                                       uint32_t worker_start_us,
+                                       uint32_t worker_end_us) {
+    SdlMdMailbox *mailbox = sdl_md_mailbox();
+
+    critical_section_enter_blocking(&sdl_md_pipeline_lock);
+    sdl_md_planar_slot_state[slot] = SDL_MD_PLANAR_SLOT_READY;
+    sdl_md_planar_slot_seq[slot] = seq;
+    mailbox->ready_planar_slot = slot;
+    mailbox->palette_seq = palette_seq;
+    mailbox->worker_start_us = worker_start_us;
+    mailbox->worker_end_us = worker_end_us;
+    mailbox->worker_busy = 0;
+    mailbox->ready_seq = seq;
+    sdl_md_worker_busy = false;
+    critical_section_exit(&sdl_md_pipeline_lock);
+}
+
+static void sdl_md_worker_loop(void) {
+    while (true) {
+        SdlMdJob job;
+        bool have_job = false;
+
+        critical_section_enter_blocking(&sdl_md_pipeline_lock);
+        if (sdl_md_job_pending) {
+            job = sdl_md_pending_job;
+            sdl_md_job_pending = false;
+            sdl_md_worker_busy = true;
+            sdl_md_mailbox()->worker_busy = 1;
+            have_job = true;
+        }
+        critical_section_exit(&sdl_md_pipeline_lock);
+
+        if (!have_job) {
+            tight_loop_contents();
+            continue;
+        }
+
+        uint32_t worker_start_us = sdl_md_now_us();
+        if (job.palette_seq != sdl_md_worker_palette_seq) {
+            uint8_t hw_count = median_cut(job.palette_rgb, sdl_md_hw_pal);
+            build_bayer_pal_map(job.palette_rgb, hw_count);
+            sdl_md_worker_palette_seq = job.palette_seq;
+        }
+
+        uint16_t *target_planar = sdl_md_planar_ptr(job.target_slot);
+        if (job.full_frame) {
+            sdl_c2p(job.chunky, target_planar, sdl_md_width, sdl_md_height);
+        } else {
+            int latest_slot = sdl_md_find_latest_ready_slot();
+            if (latest_slot >= 0) {
+                memcpy(target_planar, sdl_md_planar_ptr((uint8_t)latest_slot),
+                       SDL_MD_PLANAR_SIZE);
+                sdl_c2p_rect(job.chunky, target_planar, job.x, job.y,
+                             job.rw, job.rh);
+            } else {
+                sdl_c2p(job.chunky, target_planar, sdl_md_width, sdl_md_height);
+            }
+        }
+
+        write_palette_return();
+        sdl_md_publish_ready_frame(job.target_slot, job.seq, job.palette_seq,
+                                   worker_start_us, sdl_md_now_us());
+    }
+}
+
+static void sdl_md_launch_worker_if_needed(void) {
+    if (!sdl_md_worker_launched) {
+        sdl_md_worker_launched = true;
+        multicore_launch_core1(sdl_md_worker_loop);
+    }
+}
+
+static bool sdl_md_submit_job(bool full_frame,
+                              uint32_t seq,
+                              uint16_t x, uint16_t y,
+                              uint16_t rw, uint16_t rh) {
+    SdlMdMailbox *mailbox = sdl_md_mailbox();
+    bool accepted = false;
+
+    critical_section_enter_blocking(&sdl_md_pipeline_lock);
+    int target_slot = sdl_md_find_free_planar_slot();
+    if (!sdl_md_job_pending && !sdl_md_worker_busy && (target_slot >= 0)) {
+        sdl_md_pending_job.seq = seq;
+        sdl_md_pending_job.palette_seq = sdl_md_current_palette_seq;
+        sdl_md_pending_job.submit_time_us = sdl_md_now_us();
+        sdl_md_pending_job.chunky = sdl_md_chunky_buffers[sdl_md_upload_chunky_index];
+        sdl_md_pending_job.target_slot = (uint8_t)target_slot;
+        sdl_md_pending_job.full_frame = full_frame;
+        sdl_md_pending_job.x = x;
+        sdl_md_pending_job.y = y;
+        sdl_md_pending_job.rw = rw;
+        sdl_md_pending_job.rh = rh;
+        memcpy(sdl_md_pending_job.palette_rgb, sdl_md_current_palette_rgb,
+               sizeof(sdl_md_pending_job.palette_rgb));
+        sdl_md_planar_slot_state[target_slot] = SDL_MD_PLANAR_SLOT_RENDERING;
+        mailbox->submit_time_us = sdl_md_pending_job.submit_time_us;
+        mailbox->submit_seq = seq;
+        sdl_md_upload_chunky_index ^= 1u;
+        sdl_md_job_pending = true;
+        accepted = true;
+    } else {
+        mailbox->dropped_frames++;
+    }
+    mailbox->worker_busy = (sdl_md_job_pending || sdl_md_worker_busy) ? 1u : 0u;
+    critical_section_exit(&sdl_md_pipeline_lock);
+
+    return accepted;
+}
+
+static void sdl_md_release_frame(uint32_t seq) {
+    critical_section_enter_blocking(&sdl_md_pipeline_lock);
+    for (int i = 0; i < SDL_MD_PLANAR_SLOTS; i++) {
+        if ((sdl_md_planar_slot_state[i] == SDL_MD_PLANAR_SLOT_READY) &&
+            (sdl_md_planar_slot_seq[i] == seq)) {
+            sdl_md_planar_slot_state[i] = SDL_MD_PLANAR_SLOT_FREE;
+            sdl_md_planar_slot_seq[i] = 0;
+            break;
+        }
+    }
+    critical_section_exit(&sdl_md_pipeline_lock);
+}
+
 /* =========================================================================
  * Command handlers
  * ========================================================================= */
@@ -487,17 +732,25 @@ static void cmd_init(const TransmissionProtocol *proto) {
     sdl_md_width  = width;
     sdl_md_height = height;
     sdl_md_bpp    = bpp;
-    memset(sdl_md_chunky, 0, SDL_MD_CHUNKY_SIZE);
+    sdl_md_clear_runtime_buffers();
     init_default_palette();
+    fill_default_palette_rgb(sdl_md_current_palette_rgb);
+    sdl_md_current_palette_seq = 0;
+    sdl_md_worker_palette_seq = 0;
+    sdl_md_reset_pipeline_state();
     write_palette_return();
     DPRINTF("SDL_MD_INIT: %ux%u bpp=%u\n", sdl_md_width, sdl_md_height, sdl_md_bpp);
 }
 
 static void cmd_quit(const TransmissionProtocol *proto) {
     (void)proto;
-    memset(sdl_md_chunky, 0, SDL_MD_CHUNKY_SIZE);
-    memset((void *)mem_framebuffer_addr, 0, 32000);
+    sdl_md_clear_runtime_buffers();
     init_default_palette();
+    fill_default_palette_rgb(sdl_md_current_palette_rgb);
+    sdl_md_current_palette_seq = 0;
+    sdl_md_worker_palette_seq = 0;
+    sdl_md_reset_pipeline_state();
+    write_palette_return();
     DPRINTF("SDL_MD_QUIT\n");
 }
 
@@ -510,10 +763,10 @@ static void cmd_set_palette(const TransmissionProtocol *proto) {
         DPRINTF("SDL_MD_SET_PALETTE: short payload (%u)\n", available);
         return;
     }
-    uint8_t hw_count = median_cut(rgb, sdl_md_hw_pal);
-    build_bayer_pal_map(rgb, hw_count);
-    write_palette_return();
-    DPRINTF("SDL_MD_SET_PALETTE: done\n");
+    memcpy(sdl_md_current_palette_rgb, rgb, 768);
+    sdl_md_current_palette_seq++;
+    DPRINTF("SDL_MD_SET_PALETTE: seq=%lu\n",
+            (unsigned long)sdl_md_current_palette_seq);
 }
 
 static void cmd_blit_surface(const TransmissionProtocol *proto) {
@@ -529,6 +782,7 @@ static void cmd_blit_surface(const TransmissionProtocol *proto) {
     uint16_t srcpitch = (uint16_t)(d5 >> 16);
 
     const uint8_t *src = proto->payload + 16;
+    uint8_t *chunky = sdl_md_chunky_buffers[sdl_md_upload_chunky_index];
     uint16_t available = proto->payload_size > 16
                          ? (uint16_t)(proto->payload_size - 16) : 0;
     if ((bw == 0) || (bh == 0) || (x >= sdl_md_width) || (y >= sdl_md_height)) {
@@ -553,7 +807,7 @@ static void cmd_blit_surface(const TransmissionProtocol *proto) {
 
         uint32_t dst_offset = (uint32_t)(y + row) * sdl_md_width + x;
         if (dst_offset + copy_len > SDL_MD_CHUNKY_SIZE) break;
-        memcpy(&sdl_md_chunky[dst_offset], src + src_offset, copy_len);
+        memcpy(&chunky[dst_offset], src + src_offset, copy_len);
     }
 }
 
@@ -569,6 +823,8 @@ static void cmd_fill_rect(const TransmissionProtocol *proto) {
     uint16_t fh = (uint16_t)(d4 & 0xFFFFu);
     uint8_t  color = (uint8_t)(d5 >> 16);
 
+    uint8_t *chunky = sdl_md_chunky_buffers[sdl_md_upload_chunky_index];
+
     if ((fw == 0) || (fh == 0) || (x >= sdl_md_width) || (y >= sdl_md_height)) {
         return;
     }
@@ -577,31 +833,56 @@ static void cmd_fill_rect(const TransmissionProtocol *proto) {
 
     for (int row = y; row < y + fh && row < sdl_md_height; row++) {
         uint32_t dst_offset = (uint32_t)row * sdl_md_width + x;
-        memset(&sdl_md_chunky[dst_offset], color, fw);
+        memset(&chunky[dst_offset], color, fw);
     }
 }
 
 static void cmd_flip(const TransmissionProtocol *proto) {
-    (void)proto;
-    sdl_c2p(sdl_md_chunky, (uint16_t *)mem_framebuffer_addr,
-            sdl_md_width, sdl_md_height);
-    DPRINTF("SDL_MD_FLIP\n");
+    const uint16_t *payload = (const uint16_t *)proto->payload;
+    uint32_t seq = TPROTO_GET_PAYLOAD_PARAM32(payload + 2);
+
+    if (seq == 0) {
+        seq = sdl_md_mailbox()->submit_seq + 1u;
+    }
+    if (!sdl_md_submit_job(true, seq, 0, 0, 0, 0)) {
+        DPRINTF("SDL_MD_FLIP: busy/drop seq=%lu\n", (unsigned long)seq);
+        return;
+    }
+    DPRINTF("SDL_MD_FLIP: queued seq=%lu\n", (unsigned long)seq);
 }
 
 static void cmd_update_rect(const TransmissionProtocol *proto) {
     const uint16_t *payload = (const uint16_t *)proto->payload;
     uint32_t d3 = TPROTO_GET_PAYLOAD_PARAM32(payload + 2);
     uint32_t d4 = TPROTO_GET_PAYLOAD_PARAM32(payload + 4);
+    uint32_t d5 = TPROTO_GET_PAYLOAD_PARAM32(payload + 6);
     uint16_t x  = (uint16_t)(d3 >> 16);
     uint16_t y  = (uint16_t)(d3 & 0xFFFFu);
     uint16_t rw = (uint16_t)(d4 >> 16);
     uint16_t rh = (uint16_t)(d4 & 0xFFFFu);
-    sdl_c2p_rect(x, y, rw, rh);
+    uint32_t seq = d5;
+
+    if (seq == 0) {
+        seq = sdl_md_mailbox()->submit_seq + 1u;
+    }
+    if (!sdl_md_submit_job(false, seq, x, y, rw, rh)) {
+        DPRINTF("SDL_MD_UPDATE_RECT: busy/drop seq=%lu\n",
+                (unsigned long)seq);
+    }
 }
 
 static void cmd_ping(const TransmissionProtocol *proto) {
     (void)proto;
     /* Token is echoed by the normal path in sdl_dispatch */
+}
+
+static void cmd_release_frame(const TransmissionProtocol *proto) {
+    const uint16_t *payload = (const uint16_t *)proto->payload;
+    uint32_t seq = TPROTO_GET_PAYLOAD_PARAM32(payload + 2);
+
+    if (seq != 0) {
+        sdl_md_release_frame(seq);
+    }
 }
 
 /* =========================================================================
@@ -664,12 +945,14 @@ static void sdl_dispatch(const TransmissionProtocol *proto) {
         case SDL_MD_FLIP:         cmd_flip(proto);         break;
         case SDL_MD_UPDATE_RECT:  cmd_update_rect(proto);  break;
         case SDL_MD_PING:         cmd_ping(proto);         break;
+        case SDL_MD_RELEASE_FRAME: cmd_release_frame(proto); break;
         default:
             DPRINTF("SDL unknown command: %u\n", proto->command_id);
             break;
     }
 
     TPROTO_SET_RANDOM_TOKEN(mem_random_token_addr, token);
+    TPROTO_SET_RANDOM_TOKEN(mem_random_token_seed_addr, sdl_md_next_token_seed());
 }
 
 /* =========================================================================
@@ -678,27 +961,40 @@ static void sdl_dispatch(const TransmissionProtocol *proto) {
 void emul_start(void) {
     /* Compute sub-addresses within the ST-visible ROM4 window */
     uint32_t rom_base = (uint32_t)&__rom_in_ram_start__;
-    mem_framebuffer_addr   = rom_base + SDL_MD_FRAMEBUFFER_OFFSET;
+    mem_framebuffer_addr[0] = rom_base + SDL_MD_FRAMEBUFFER0_OFFSET;
+    mem_framebuffer_addr[1] = rom_base + SDL_MD_FRAMEBUFFER1_OFFSET;
     mem_random_token_addr  = rom_base + SDL_MD_RANDOM_TOKEN_OFFSET;
+    mem_random_token_seed_addr = rom_base + SDL_MD_RANDOM_SEED_OFFSET;
+    mem_mailbox_addr = rom_base + SDL_MD_MAILBOX_OFFSET;
     mem_palette_return_addr = rom_base + SDL_MD_PALETTE_RETURN_OFFSET;
+    sdl_md_chunky_buffers[0] = sdl_md_chunky;
+    sdl_md_chunky_buffers[1] = (uint8_t *)(rom_base + ROM_SIZE_BYTES);
+    critical_section_init(&sdl_md_pipeline_lock);
 
     /* Initialise default EGA palette */
     init_default_palette();
+    fill_default_palette_rgb(sdl_md_current_palette_rgb);
+    sdl_md_current_palette_seq = 0;
+    sdl_md_worker_palette_seq = 0;
+    sdl_md_reset_pipeline_state();
     write_palette_return();
+    TPROTO_SET_RANDOM_TOKEN(mem_random_token_seed_addr, sdl_md_next_token_seed());
+    TPROTO_SET_RANDOM_TOKEN(mem_random_token_addr, 0);
 
     /* Copy the ST-side boot stub into ROM_IN_RAM */
     COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length);
 
-    /* Render the boot message into the framebuffer at $FA8000.
-     * display_setupU8g2() points u8g2 directly at ROM_IN_RAM + 0x8000, which
-     * is the same region the ST's main.s copies to screen memory every vsync.
-     * The message is therefore visible on the ST as soon as the bus is live. */
+    /* Render the boot message into the startup display buffer.
+     * This is independent from the async SDL frame slots and is cleared on the
+     * first SDL_MD_INIT/SDL_MD_QUIT reset path. */
     display_setupU8g2();
     u8g2_t *u8g2 = display_getU8g2Ref();
     u8g2_ClearBuffer(u8g2);
     u8g2_SetFont(u8g2, u8g2_font_squeezed_b7_tr);
     u8g2_DrawStr(u8g2, 4, 12, "MD/SDL: SDL coprocessor is ready");
     u8g2_SendBuffer(u8g2);
+
+    sdl_md_launch_worker_if_needed();
 
     /* Start the cartridge bus emulator with our DMA IRQ handler */
     if (init_romemul(NULL, sdl_md_dma_irq_handler_lookup, false) < 0) {

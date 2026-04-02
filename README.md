@@ -8,18 +8,16 @@ Welcome to the SDL 1.2 video co-processor for the Atari ST with SidecarTridge Mu
 
 MD/SDL turns the RP2040 inside the SidecarTridge into a graphics co-processor for SDL 1.2 applications — including Doom, Hexen, and Heretic — running on the Atari ST.
 
-The ST maintains a simple 320×200 8bpp chunky pixel surface in RAM. When the application calls `SDL_Flip()`, the ST sends that surface to the RP2040 over the cartridge bus. The RP2040 performs 256→16 colour palette reduction using median cut, precomputes Bayer-dithered palette mappings, converts the result from chunky to ST planar format (C2P), and writes the finished frame directly into the ROM4 window at `$FA8000`. The ST reads it straight back to the screen — no software C2P on the 68000 at all.
+The ST maintains a simple 320×200 8bpp chunky pixel surface in RAM. When the application calls `SDL_Flip()`, the ST sends that surface to the RP2040 over the cartridge bus. The RP2040 performs 256→16 colour palette reduction using median cut, precomputes Bayer-dithered palette mappings, converts the result from chunky to ST planar format (C2P), and writes the finished frame into one of two ST-visible planar slots in the ROM4 window. The ST copies the ready slot back to screen RAM, so there is no software C2P on the 68000 at all.
 
 ## Progress
 
-The plan is to move as much of SDL's graphics processing to the MD as possible, starting with the most CPU intensive and progressing from there:
+The plan is to move as much of SDL's graphics processing to the MD as possible, including the chunky buffer itself if we can work out how to enable direct pixel writes, starting with the most CPU intensive and progressing from there:
 
-✅ Palette handling
-✅ C2P processing
-✅ Bayer dithering
-⬜ Non-blocking (async / parallel) data processing
-⬜ Move the chunky buffer to the RP2040 that doesn't break direct pixel writes
-⬜ A whole bunch of other things
+- ✅ Palette handling
+- ✅ C2P processing
+- ✅ Bayer dithering
+- ✅ Parallel data processing
 
 ## How it works
 
@@ -29,14 +27,15 @@ Atari ST (68000)                          RP2040
 SDL_SetVideoMode()  ──CMD 0x01──►  init chunky surface
 SDL_SetColors()     ──CMD 0x03──►  median cut → Bayer maps → 16 colours → $FAF400
 SDL_Flip()          ──CMD 0x04──►  blit chunky rows (×34 chunks)
-                    ──CMD 0x06──►  Bayer-dithered C2P → planar frame → $FA8000
-ST copies $FA8000   ◄──────────   blitter (STE) or CPU (ST) copies to screen RAM
+                    ──CMD 0x06──►  queue async Bayer-dithered C2P on core 1
+vsync / next flip   ◄──────────   mailbox says which planar slot is ready
+ST copies ready slot◄──────────   blitter (STE) or CPU (ST) copies to screen RAM
 Setscreen(screen RAM)              Shifter reads from ST RAM — no ROM4 contention
 ```
 
-Pointing `Setscreen` directly at `$FA8000` (ROM4) causes the Shifter to steal ROM4 bus cycles from the 68000 on every scanline, starving the BLIT_SURFACE commands. The SDL driver copies the finished planar frame to a screen-RAM buffer each frame and points `Setscreen` there instead. On STE the hardware blitter handles the copy in ~1 ms; on plain ST the CPU copy takes ~20 ms but still performs better than continuous Shifter contention.
+Pointing `Setscreen` directly at ROM4 causes the Shifter to steal ROM4 bus cycles from the 68000 on every scanline, starving the BLIT_SURFACE commands. The SDL driver copies the finished planar frame to a screen-RAM buffer each frame and points `Setscreen` there instead. On STE the hardware blitter handles the copy in ~1 ms; on plain ST the CPU copy takes ~20 ms but still performs better than continuous Shifter contention.
 
-The palette return area at `$FAF400` contains 16 STE-format `uint16_t` values that are applied via `Setpalette()` after each palette change. The random token at `$FAF000` is polled after every command to synchronise the ST with the RP2040.
+The palette return area at `$FAFA80` contains 16 STE-format `uint16_t` values. A mailbox at `$FAFA20` reports `submit_seq`, `ready_seq`, `palette_seq`, `worker_busy`, and timing counters. The random token at `$FAFA00` is still polled after every command to synchronise the ST with the RP2040.
 
 ## Hardware requirements
 
@@ -78,32 +77,38 @@ SDL_Surface *screen = SDL_SetVideoMode(320, 200, 8, SDL_HWPALETTE);
 SDL_Flip(screen);   /* uploads chunky surface, triggers C2P on RP2040 */
 ```
 
-`SDL_SetColors()` sends the full 256-entry palette to the RP2040 for median-cut reduction. The firmware also precomputes 4×4 Bayer-phase palette maps so `SDL_Flip()` and `SDL_UpdateRects()` can ordered-dither indexed pixels during C2P. The 16 resulting hardware colours are applied automatically.
+`SDL_SetColors()` sends the full 256-entry palette to the RP2040 for median-cut reduction. The firmware precomputes 4×4 Bayer-phase palette maps so `SDL_Flip()` and `SDL_UpdateRects()` can ordered-dither indexed pixels during C2P. `SDL_Flip()` and `SDL_UpdateRects()` now submit asynchronous conversion work; the ST presents the most recent ready planar slot on `Vsync()` or at the start of the next flip.
 
 ## Memory layout
 
-| Region             | ST address | RP2040 address | Size     | Content                            |
-| ------------------ | ---------- | -------------- | -------- | ---------------------------------- |
-| ROM4 window        | `$FA0000`  | `0x20020000`   | 128 KB   | ROM-in-RAM                         |
-| Planar framebuffer | `$FA8000`  | `0x20028000`   | 32 000 B | C2P output — ST reads directly     |
-| Random token       | `$FAF000`  | `0x2002F000`   | 4 B      | Completion sync token              |
-| Token seed         | `$FAF004`  | `0x2002F004`   | 4 B      | Seed for next token                |
-| Palette return     | `$FAF400`  | `0x2002F400`   | 32 B     | 16 × STE uint16_t hardware colours |
+| Region                  | ST address | RP2040 offset | Size     | Content                                    |
+| ----------------------- | ---------- | ------------- | -------- | ------------------------------------------ |
+| ROM4 window             | `$FA0000`  | `+0x0000`     | 128 KB   | ST-visible ROM-in-RAM                      |
+| Planar slot 0           | `$FA0000`  | `+0x0000`     | 32 000 B | Ready/render target planar framebuffer     |
+| Planar slot 1           | `$FA7D00`  | `+0x7D00`     | 32 000 B | Ready/render target planar framebuffer     |
+| Random token            | `$FAFA00`  | `+0xFA00`     | 4 B      | Completion sync token                      |
+| Token seed              | `$FAFA04`  | `+0xFA04`     | 4 B      | Seed for next token                        |
+| Async mailbox           | `$FAFA20`  | `+0xFA20`     | 36 B     | Frame submit/ready status and timings      |
+| Palette return          | `$FAFA80`  | `+0xFA80`     | 32 B     | 16 × STE `uint16_t` hardware colours       |
+| Shared variables        | `$FAFC00`  | `+0xFC00`     | 1 KB     | Boot-stub shared state                     |
+
+ROM3 reads remain part of the command transport, so the second visible planar slot cannot live at `$FB0000`. Instead, ROM3 is used internally by the RP2040 as the second chunky staging buffer while both ST-visible planar slots stay in ROM4.
 
 ## Command reference
 
-| ID   | Name                  | d3                    | d4             | d5               | Inline buf      | RP2040 action                                         |
-| ---- | --------------------- | --------------------- | -------------- | ---------------- | --------------- | ----------------------------------------------------- |
-| 0x01 | `SDL_MD_INIT`         | `(width<<16)\|height` | `(bpp<<16)\|0` | 0                | —               | Clear chunky surface; reset palette                   |
-| 0x02 | `SDL_MD_QUIT`         | 0                     | 0              | 0                | —               | Clear chunky surface and palette                      |
-| 0x03 | `SDL_MD_SET_PALETTE`  | `(256<<16)\|0`        | 0              | 0                | 768 B (256×RGB) | Median cut + Bayer maps → 16 colours; write `$FAF400` |
-| 0x04 | `SDL_MD_BLIT_SURFACE` | `(x<<16)\|y`          | `(w<<16)\|h`   | `(pitch<<16)\|0` | up to 1920 B    | Copy chunky rect into internal surface                |
-| 0x05 | `SDL_MD_FILL_RECT`    | `(x<<16)\|y`          | `(w<<16)\|h`   | `(color<<16)\|0` | —               | Fill rect in chunky surface                           |
-| 0x06 | `SDL_MD_FLIP`         | 0                     | 0              | 0                | —               | Bayer-dithered C2P → `$FA8000`                        |
-| 0x07 | `SDL_MD_UPDATE_RECT`  | `(x<<16)\|y`          | `(w<<16)\|h`   | 0                | —               | Partial Bayer-dithered C2P of dirty rect              |
-| 0x08 | `SDL_MD_PING`         | 0                     | 0              | 0                | —               | Echo token (used for detection)                       |
+| ID   | Name                  | d3                    | d4             | d5               | Inline buf      | RP2040 action                                           |
+| ---- | --------------------- | --------------------- | -------------- | ---------------- | --------------- | ------------------------------------------------------- |
+| 0x01 | `SDL_MD_INIT`         | `(width<<16)\|height` | `(bpp<<16)\|0` | 0                | —               | Clear buffers, reset palette, reset mailbox             |
+| 0x02 | `SDL_MD_QUIT`         | 0                     | 0              | 0                | —               | Clear buffers, reset palette, reset mailbox             |
+| 0x03 | `SDL_MD_SET_PALETTE`  | `(256<<16)\|0`        | 0              | 0                | 768 B (256×RGB) | Store palette for the next submitted frame              |
+| 0x04 | `SDL_MD_BLIT_SURFACE` | `(x<<16)\|y`          | `(w<<16)\|h`   | `(pitch<<16)\|0` | up to 1920 B    | Copy chunky rect into the current upload staging buffer |
+| 0x05 | `SDL_MD_FILL_RECT`    | `(x<<16)\|y`          | `(w<<16)\|h`   | `(color<<16)\|0` | —               | Fill rect in the current upload staging buffer          |
+| 0x06 | `SDL_MD_FLIP`         | `seq`                 | 0              | 0                | —               | Submit full-frame async conversion job                  |
+| 0x07 | `SDL_MD_UPDATE_RECT`  | `(x<<16)\|y`          | `(w<<16)\|h`   | `seq`            | —               | Submit partial async conversion job                     |
+| 0x08 | `SDL_MD_PING`         | `0x4D44534C`          | 0              | 0                | —               | Echo token (used for detection)                         |
+| 0x09 | `SDL_MD_RELEASE_FRAME`| `seq`                 | 0              | 0                | —               | Mark a presented planar slot reusable                   |
 
-A full 320×200 frame upload (`SDL_Flip`) uses 34 `SDL_MD_BLIT_SURFACE` commands (6 rows × 320 B = 1920 B each) followed by one `SDL_MD_FLIP`. A dirty-rect update (`SDL_UpdateRects`) sends only the changed rows via `SDL_MD_BLIT_SURFACE` then uses `SDL_MD_UPDATE_RECT` for the partial C2P (single rect) or `SDL_MD_FLIP` (multiple rects).
+A full 320×200 frame upload (`SDL_Flip`) uses 34 `SDL_MD_BLIT_SURFACE` commands (6 rows × 320 B = 1920 B each) followed by one `SDL_MD_FLIP(seq)`. A dirty-rect update (`SDL_UpdateRects`) sends only the changed rows via `SDL_MD_BLIT_SURFACE` then uses `SDL_MD_UPDATE_RECT(..., seq)` for the partial C2P (single rect) or `SDL_MD_FLIP(seq)` (multiple rects). The ST polls the mailbox on `Vsync()` or at the start of the next flip, presents any ready frame, then acknowledges it with `SDL_MD_RELEASE_FRAME(seq)`.
 
 ## Build prerequisites
 
@@ -204,7 +209,7 @@ Each command from the ST then appears as `SDL_MD_INIT: 320x200 bpp=8`, `SDL_MD_F
 | ST hangs on first `SDL_Flip()` | UART timeout — confirm the UF2 is flashed and check UART log for `ready, waiting for commands`     |
 | Garbled colours                | Palette not sent before first flip — ensure `SDL_SetColors()` is called after `SDL_SetVideoMode()` |
 | `stcmd` fails with "not a TTY" | Run with `pty=true` or use the `stcmd` wrapper script                                              |
-| Screen stays black after flip  | Check `$FAF000` — if it never matches `expected_token`, the bus sync is failing                    |
+| Screen stays black after flip  | Check `$FAFA00` — if it never matches `expected_token`, the bus sync is failing                    |
 
 ## License
 

@@ -20,12 +20,13 @@ ROM4_ADDR   equ $FA0000
 SCREEN_SIZE equ (-4096)     ; scratch area just before screen memory
 
 ; Protocol addresses
-RANDOM_TOKEN_ADDR       equ (ROM4_ADDR + $F000)
+RANDOM_TOKEN_ADDR       equ (ROM4_ADDR + $FA00)
 RANDOM_TOKEN_SEED_ADDR  equ (RANDOM_TOKEN_ADDR + 4)
 SHARED_VARIABLES        equ (RANDOM_TOKEN_ADDR + $200)
 ROMCMD_START_ADDR       equ $FB0000
 CMD_MAGIC_NUMBER        equ $ABCD
 CMD_RETRIES_COUNT       equ 3
+COMMAND_TIMEOUT        equ $0000FFFF
 CMD_SET_SHARED_VAR      equ 1
 
 _dskbufp    equ $4c6
