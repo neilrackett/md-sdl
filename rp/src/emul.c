@@ -43,6 +43,10 @@ uint8_t  sdl_md_bpp    = 8;
 #define SDL_MD_BAYER_PHASES  (SDL_MD_BAYER_DIM * SDL_MD_BAYER_DIM)
 
 static uint8_t sdl_md_bayer_pal_map[SDL_MD_BAYER_PHASES][256];
+static uint32_t __attribute__((aligned(64)))
+    sdl_md_plane_mask_lo[16][16];
+static uint32_t __attribute__((aligned(64)))
+    sdl_md_plane_mask_hi[16][16];
 static uint8_t sdl_md_current_palette_rgb[256 * 3];
 static uint32_t sdl_md_current_palette_seq = 0;
 static uint32_t sdl_md_worker_palette_seq = 0;
@@ -85,6 +89,8 @@ static volatile bool sdl_md_worker_busy = false;
 static SdlMdJob sdl_md_pending_job;
 static volatile uint8_t sdl_md_planar_slot_state[SDL_MD_PLANAR_SLOTS];
 static uint32_t sdl_md_planar_slot_seq[SDL_MD_PLANAR_SLOTS];
+static int8_t sdl_md_display_base_slot = -1;
+static uint32_t sdl_md_display_base_seq = 0;
 
 /* =========================================================================
  * Protocol double-buffer (same pattern as term.c)
@@ -229,6 +235,24 @@ static void fill_default_palette_rgb(uint8_t *rgb768) {
         rgb768[i * 3 + 0] = ste_chan_to_8bit((c >> 8) & 0xF);
         rgb768[i * 3 + 1] = ste_chan_to_8bit((c >> 4) & 0xF);
         rgb768[i * 3 + 2] = ste_chan_to_8bit(c & 0xF);
+    }
+}
+
+static void init_c2p_mask_lut(void) {
+    for (int px = 0; px < 16; px++) {
+        uint32_t bit = 1u << (15 - px);
+        for (int mapped = 0; mapped < 16; mapped++) {
+            uint32_t lo = 0;
+            uint32_t hi = 0;
+
+            if (mapped & 0x1) lo |= bit;
+            if (mapped & 0x2) lo |= bit << 16;
+            if (mapped & 0x4) hi |= bit;
+            if (mapped & 0x8) hi |= bit << 16;
+
+            sdl_md_plane_mask_lo[px][mapped] = lo;
+            sdl_md_plane_mask_hi[px][mapped] = hi;
+        }
     }
 }
 
@@ -404,6 +428,52 @@ static uint8_t median_cut(const uint8_t *rgb768, uint16_t *hw_pal_out) {
     return (uint8_t)num_boxes;
 }
 
+static inline __attribute__((always_inline)) void sdl_md_pack_block(
+    const uint8_t *map0, const uint8_t *map1,
+    const uint8_t *map2, const uint8_t *map3,
+    const uint8_t *src, uint16_t *dst) {
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+
+    lo |= sdl_md_plane_mask_lo[0][map0[src[0]]];
+    hi |= sdl_md_plane_mask_hi[0][map0[src[0]]];
+    lo |= sdl_md_plane_mask_lo[1][map1[src[1]]];
+    hi |= sdl_md_plane_mask_hi[1][map1[src[1]]];
+    lo |= sdl_md_plane_mask_lo[2][map2[src[2]]];
+    hi |= sdl_md_plane_mask_hi[2][map2[src[2]]];
+    lo |= sdl_md_plane_mask_lo[3][map3[src[3]]];
+    hi |= sdl_md_plane_mask_hi[3][map3[src[3]]];
+    lo |= sdl_md_plane_mask_lo[4][map0[src[4]]];
+    hi |= sdl_md_plane_mask_hi[4][map0[src[4]]];
+    lo |= sdl_md_plane_mask_lo[5][map1[src[5]]];
+    hi |= sdl_md_plane_mask_hi[5][map1[src[5]]];
+    lo |= sdl_md_plane_mask_lo[6][map2[src[6]]];
+    hi |= sdl_md_plane_mask_hi[6][map2[src[6]]];
+    lo |= sdl_md_plane_mask_lo[7][map3[src[7]]];
+    hi |= sdl_md_plane_mask_hi[7][map3[src[7]]];
+    lo |= sdl_md_plane_mask_lo[8][map0[src[8]]];
+    hi |= sdl_md_plane_mask_hi[8][map0[src[8]]];
+    lo |= sdl_md_plane_mask_lo[9][map1[src[9]]];
+    hi |= sdl_md_plane_mask_hi[9][map1[src[9]]];
+    lo |= sdl_md_plane_mask_lo[10][map2[src[10]]];
+    hi |= sdl_md_plane_mask_hi[10][map2[src[10]]];
+    lo |= sdl_md_plane_mask_lo[11][map3[src[11]]];
+    hi |= sdl_md_plane_mask_hi[11][map3[src[11]]];
+    lo |= sdl_md_plane_mask_lo[12][map0[src[12]]];
+    hi |= sdl_md_plane_mask_hi[12][map0[src[12]]];
+    lo |= sdl_md_plane_mask_lo[13][map1[src[13]]];
+    hi |= sdl_md_plane_mask_hi[13][map1[src[13]]];
+    lo |= sdl_md_plane_mask_lo[14][map2[src[14]]];
+    hi |= sdl_md_plane_mask_hi[14][map2[src[14]]];
+    lo |= sdl_md_plane_mask_lo[15][map3[src[15]]];
+    hi |= sdl_md_plane_mask_hi[15][map3[src[15]]];
+
+    dst[0] = (uint16_t)lo;
+    dst[1] = (uint16_t)(lo >> 16);
+    dst[2] = (uint16_t)hi;
+    dst[3] = (uint16_t)(hi >> 16);
+}
+
 /* =========================================================================
  * C2P: chunky (8bpp indices) → ST planar using Bayer-phase palette maps
  *
@@ -411,8 +481,10 @@ static uint8_t median_cut(const uint8_t *rgb768, uint16_t *hw_pal_out) {
  * 16-pixel block.  Pixel p occupies bit (15 - p%16) of each plane word.
  * Plane 0 = LSB, plane 3 = MSB of the 4-bit palette index.
  * ========================================================================= */
-static void sdl_c2p(const uint8_t *chunky, uint16_t *planar,
-                    uint16_t w, uint16_t h) {
+static void __not_in_flash_func(sdl_c2p)(const uint8_t *chunky,
+                                         uint16_t *planar,
+                                         uint16_t w,
+                                         uint16_t h) {
     int blocks_per_row = w / 16;
     for (int y = 0; y < h; y++) {
         uint8_t row_phase = (uint8_t)((y & (SDL_MD_BAYER_DIM - 1u)) << 2);
@@ -423,41 +495,9 @@ static void sdl_c2p(const uint8_t *chunky, uint16_t *planar,
         const uint8_t *row = chunky + y * w;
         uint16_t *prow = planar + y * blocks_per_row * 4;
         for (int blk = 0; blk < blocks_per_row; blk++) {
-            uint16_t p0 = 0, p1 = 0, p2 = 0, p3 = 0;
             const uint8_t *src = row + blk * 16;
-            for (int px = 0; px < 16; px += 4) {
-                uint8_t mapped = map0[src[px + 0]];
-                uint16_t bit = (uint16_t)(1u << (15 - (px + 0)));
-                if (mapped & 1) p0 |= bit;
-                if (mapped & 2) p1 |= bit;
-                if (mapped & 4) p2 |= bit;
-                if (mapped & 8) p3 |= bit;
-
-                mapped = map1[src[px + 1]];
-                bit = (uint16_t)(1u << (15 - (px + 1)));
-                if (mapped & 1) p0 |= bit;
-                if (mapped & 2) p1 |= bit;
-                if (mapped & 4) p2 |= bit;
-                if (mapped & 8) p3 |= bit;
-
-                mapped = map2[src[px + 2]];
-                bit = (uint16_t)(1u << (15 - (px + 2)));
-                if (mapped & 1) p0 |= bit;
-                if (mapped & 2) p1 |= bit;
-                if (mapped & 4) p2 |= bit;
-                if (mapped & 8) p3 |= bit;
-
-                mapped = map3[src[px + 3]];
-                bit = (uint16_t)(1u << (15 - (px + 3)));
-                if (mapped & 1) p0 |= bit;
-                if (mapped & 2) p1 |= bit;
-                if (mapped & 4) p2 |= bit;
-                if (mapped & 8) p3 |= bit;
-            }
-            prow[blk*4 + 0] = p0;
-            prow[blk*4 + 1] = p1;
-            prow[blk*4 + 2] = p2;
-            prow[blk*4 + 3] = p3;
+            sdl_md_pack_block(map0, map1, map2, map3,
+                              src, &prow[blk * 4]);
         }
     }
 }
@@ -493,41 +533,9 @@ static void sdl_c2p_rect(const uint8_t *chunky, uint16_t *planar,
         const uint8_t *src = chunky + row * sdl_md_width;
         uint16_t *prow = planar + row * blocks_per_row * 4;
         for (int blk = blk_start; blk < blk_end; blk++) {
-            uint16_t p0 = 0, p1 = 0, p2 = 0, p3 = 0;
             const uint8_t *blk_src = src + blk * 16;
-            for (int px = 0; px < 16; px += 4) {
-                uint8_t mapped = map0[blk_src[px + 0]];
-                uint16_t bit = (uint16_t)(1u << (15 - (px + 0)));
-                if (mapped & 1) p0 |= bit;
-                if (mapped & 2) p1 |= bit;
-                if (mapped & 4) p2 |= bit;
-                if (mapped & 8) p3 |= bit;
-
-                mapped = map1[blk_src[px + 1]];
-                bit = (uint16_t)(1u << (15 - (px + 1)));
-                if (mapped & 1) p0 |= bit;
-                if (mapped & 2) p1 |= bit;
-                if (mapped & 4) p2 |= bit;
-                if (mapped & 8) p3 |= bit;
-
-                mapped = map2[blk_src[px + 2]];
-                bit = (uint16_t)(1u << (15 - (px + 2)));
-                if (mapped & 1) p0 |= bit;
-                if (mapped & 2) p1 |= bit;
-                if (mapped & 4) p2 |= bit;
-                if (mapped & 8) p3 |= bit;
-
-                mapped = map3[blk_src[px + 3]];
-                bit = (uint16_t)(1u << (15 - (px + 3)));
-                if (mapped & 1) p0 |= bit;
-                if (mapped & 2) p1 |= bit;
-                if (mapped & 4) p2 |= bit;
-                if (mapped & 8) p3 |= bit;
-            }
-            prow[blk*4 + 0] = p0;
-            prow[blk*4 + 1] = p1;
-            prow[blk*4 + 2] = p2;
-            prow[blk*4 + 3] = p3;
+            sdl_md_pack_block(map0, map1, map2, map3,
+                              blk_src, &prow[blk * 4]);
         }
     }
 }
@@ -544,6 +552,8 @@ static void sdl_md_reset_pipeline_state(void) {
     sdl_md_job_pending = false;
     sdl_md_worker_busy = false;
     sdl_md_upload_chunky_index = 0;
+    sdl_md_display_base_slot = -1;
+    sdl_md_display_base_seq = 0;
     for (int i = 0; i < SDL_MD_PLANAR_SLOTS; i++) {
         sdl_md_planar_slot_state[i] = SDL_MD_PLANAR_SLOT_FREE;
         sdl_md_planar_slot_seq[i] = 0;
@@ -569,18 +579,16 @@ static int sdl_md_find_free_planar_slot(void) {
     return -1;
 }
 
-static int sdl_md_find_latest_ready_slot(void) {
-    int best_slot = -1;
-    uint32_t best_seq = 0;
-
-    for (int i = 0; i < SDL_MD_PLANAR_SLOTS; i++) {
-        if ((sdl_md_planar_slot_state[i] == SDL_MD_PLANAR_SLOT_READY) &&
-            (sdl_md_planar_slot_seq[i] >= best_seq)) {
-            best_seq = sdl_md_planar_slot_seq[i];
-            best_slot = i;
-        }
+static int sdl_md_find_partial_target_slot(void) {
+    if ((sdl_md_display_base_slot >= 0) &&
+        (sdl_md_display_base_slot < SDL_MD_PLANAR_SLOTS) &&
+        (sdl_md_display_base_seq != 0) &&
+        (sdl_md_planar_slot_state[(uint8_t)sdl_md_display_base_slot] ==
+         SDL_MD_PLANAR_SLOT_FREE)) {
+        return sdl_md_display_base_slot;
     }
-    return best_slot;
+
+    return -1;
 }
 
 static void sdl_md_publish_ready_frame(uint8_t slot, uint32_t seq,
@@ -623,30 +631,36 @@ static void sdl_md_worker_loop(void) {
         }
 
         uint32_t worker_start_us = sdl_md_now_us();
+        uint32_t palette_end_us = worker_start_us;
         if (job.palette_seq != sdl_md_worker_palette_seq) {
             uint8_t hw_count = median_cut(job.palette_rgb, sdl_md_hw_pal);
             build_bayer_pal_map(job.palette_rgb, hw_count);
             sdl_md_worker_palette_seq = job.palette_seq;
+            palette_end_us = sdl_md_now_us();
+            DPRINTF("SDL worker palette: seq=%lu time=%lu us\n",
+                    (unsigned long)job.palette_seq,
+                    (unsigned long)(palette_end_us - worker_start_us));
+        }
+        if (palette_end_us == worker_start_us) {
+            palette_end_us = worker_start_us;
         }
 
         uint16_t *target_planar = sdl_md_planar_ptr(job.target_slot);
         if (job.full_frame) {
             sdl_c2p(job.chunky, target_planar, sdl_md_width, sdl_md_height);
         } else {
-            int latest_slot = sdl_md_find_latest_ready_slot();
-            if (latest_slot >= 0) {
-                memcpy(target_planar, sdl_md_planar_ptr((uint8_t)latest_slot),
-                       SDL_MD_PLANAR_SIZE);
-                sdl_c2p_rect(job.chunky, target_planar, job.x, job.y,
-                             job.rw, job.rh);
-            } else {
-                sdl_c2p(job.chunky, target_planar, sdl_md_width, sdl_md_height);
-            }
+            sdl_c2p_rect(job.chunky, target_planar, job.x, job.y,
+                         job.rw, job.rh);
         }
+        uint32_t c2p_end_us = sdl_md_now_us();
+        DPRINTF("SDL worker c2p: %s seq=%lu time=%lu us\n",
+                job.full_frame ? "full" : "partial",
+                (unsigned long)job.seq,
+                (unsigned long)(c2p_end_us - palette_end_us));
 
         write_palette_return();
         sdl_md_publish_ready_frame(job.target_slot, job.seq, job.palette_seq,
-                                   worker_start_us, sdl_md_now_us());
+                                   worker_start_us, c2p_end_us);
     }
 }
 
@@ -663,16 +677,28 @@ static bool sdl_md_submit_job(bool full_frame,
                               uint16_t rw, uint16_t rh) {
     SdlMdMailbox *mailbox = sdl_md_mailbox();
     bool accepted = false;
+    int next_upload_index = 0;
 
     critical_section_enter_blocking(&sdl_md_pipeline_lock);
-    int target_slot = sdl_md_find_free_planar_slot();
+    int target_slot;
+    bool job_full_frame = full_frame;
+
+    if (full_frame) {
+        target_slot = sdl_md_find_free_planar_slot();
+    } else {
+        target_slot = sdl_md_find_partial_target_slot();
+        if (target_slot < 0) {
+            target_slot = sdl_md_find_free_planar_slot();
+            job_full_frame = true;
+        }
+    }
     if (!sdl_md_job_pending && !sdl_md_worker_busy && (target_slot >= 0)) {
         sdl_md_pending_job.seq = seq;
         sdl_md_pending_job.palette_seq = sdl_md_current_palette_seq;
         sdl_md_pending_job.submit_time_us = sdl_md_now_us();
         sdl_md_pending_job.chunky = sdl_md_chunky_buffers[sdl_md_upload_chunky_index];
         sdl_md_pending_job.target_slot = (uint8_t)target_slot;
-        sdl_md_pending_job.full_frame = full_frame;
+        sdl_md_pending_job.full_frame = job_full_frame;
         sdl_md_pending_job.x = x;
         sdl_md_pending_job.y = y;
         sdl_md_pending_job.rw = rw;
@@ -682,7 +708,8 @@ static bool sdl_md_submit_job(bool full_frame,
         sdl_md_planar_slot_state[target_slot] = SDL_MD_PLANAR_SLOT_RENDERING;
         mailbox->submit_time_us = sdl_md_pending_job.submit_time_us;
         mailbox->submit_seq = seq;
-        sdl_md_upload_chunky_index ^= 1u;
+        next_upload_index = sdl_md_upload_chunky_index ^ 1u;
+        sdl_md_upload_chunky_index = (uint8_t)next_upload_index;
         sdl_md_job_pending = true;
         accepted = true;
     } else {
@@ -690,6 +717,15 @@ static bool sdl_md_submit_job(bool full_frame,
     }
     mailbox->worker_busy = (sdl_md_job_pending || sdl_md_worker_busy) ? 1u : 0u;
     critical_section_exit(&sdl_md_pipeline_lock);
+
+    if (accepted) {
+        memcpy(sdl_md_chunky_buffers[sdl_md_upload_chunky_index],
+               sdl_md_pending_job.chunky, SDL_MD_CHUNKY_SIZE);
+        if (!full_frame && job_full_frame) {
+            DPRINTF("SDL submit: partial fallback to full seq=%lu\n",
+                    (unsigned long)seq);
+        }
+    }
 
     return accepted;
 }
@@ -700,7 +736,8 @@ static void sdl_md_release_frame(uint32_t seq) {
         if ((sdl_md_planar_slot_state[i] == SDL_MD_PLANAR_SLOT_READY) &&
             (sdl_md_planar_slot_seq[i] == seq)) {
             sdl_md_planar_slot_state[i] = SDL_MD_PLANAR_SLOT_FREE;
-            sdl_md_planar_slot_seq[i] = 0;
+            sdl_md_display_base_slot = (int8_t)i;
+            sdl_md_display_base_seq = seq;
             break;
         }
     }
@@ -970,6 +1007,7 @@ void emul_start(void) {
     sdl_md_chunky_buffers[0] = sdl_md_chunky;
     sdl_md_chunky_buffers[1] = (uint8_t *)(rom_base + ROM_SIZE_BYTES);
     critical_section_init(&sdl_md_pipeline_lock);
+    init_c2p_mask_lut();
 
     /* Initialise default EGA palette */
     init_default_palette();

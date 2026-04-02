@@ -12,12 +12,22 @@ The ST maintains a simple 320×200 8bpp chunky pixel surface in RAM. When the ap
 
 ## Progress
 
-The plan is to move as much of SDL's graphics processing to the MD as possible, including the chunky buffer itself if we can work out how to enable direct pixel writes, starting with the most CPU intensive and progressing from there:
+Taking a get it working, make it better approach, the plan is to outsource as much of SDL's graphics processing functionality to the MD as possible, starting with the most CPU intensive and progressing from there.
 
-- ✅ Palette handling
-- ✅ C2P processing
-- ✅ Bayer dithering
-- ✅ Parallel data processing
+### Implemented so far
+
+- ✅ C2P processing: ~4ms for full-frame Bayer-mapped C2P
+- ✅ Palette reduction: ~0.1ms to create 16 colour palette from 256 using median cut
+- ✅ Pipelined parallel data processing: overlaps ST upload with RP2040 frame conversion
+- ✅ Dirty rect handling
+- ✅ STE blitter path: ~1ms to copy planar data to screen
+- ✅ Up to ~25fps?
+
+### Biggest remaining performance challenges
+
+- 🤔 Cartridge upload time: ~50ms to push full 64KB surface
+- 🤔 Command overhead: 1-5ms for 34 BLIT_SURFACE commands plus FLIP
+- 🤔 ST-side display copy: 20ms without blitter to copy planar data to screen
 
 ## How it works
 
@@ -39,7 +49,7 @@ The palette return area at `$FAFA80` contains 16 STE-format `uint16_t` values. A
 
 ## Hardware requirements
 
-- **SidecarTridge Multi-device** (RP2040-based ROM cartridge emulator)
+- [SidecarTridge Multi-device](https://sidecartridge.com) (RP2040-based ROM cartridge emulator)
 - Atari ST or STE (not TT or Falcon — the driver targets ST low-res only)
 - Raspberry Pi Debug Probe or Picoprobe for flashing/debugging (optional but recommended)
 
@@ -81,32 +91,32 @@ SDL_Flip(screen);   /* uploads chunky surface, triggers C2P on RP2040 */
 
 ## Memory layout
 
-| Region                  | ST address | RP2040 offset | Size     | Content                                    |
-| ----------------------- | ---------- | ------------- | -------- | ------------------------------------------ |
-| ROM4 window             | `$FA0000`  | `+0x0000`     | 128 KB   | ST-visible ROM-in-RAM                      |
-| Planar slot 0           | `$FA0000`  | `+0x0000`     | 32 000 B | Ready/render target planar framebuffer     |
-| Planar slot 1           | `$FA7D00`  | `+0x7D00`     | 32 000 B | Ready/render target planar framebuffer     |
-| Random token            | `$FAFA00`  | `+0xFA00`     | 4 B      | Completion sync token                      |
-| Token seed              | `$FAFA04`  | `+0xFA04`     | 4 B      | Seed for next token                        |
-| Async mailbox           | `$FAFA20`  | `+0xFA20`     | 36 B     | Frame submit/ready status and timings      |
-| Palette return          | `$FAFA80`  | `+0xFA80`     | 32 B     | 16 × STE `uint16_t` hardware colours       |
-| Shared variables        | `$FAFC00`  | `+0xFC00`     | 1 KB     | Boot-stub shared state                     |
+| Region           | ST address | RP2040 offset | Size     | Content                                |
+| ---------------- | ---------- | ------------- | -------- | -------------------------------------- |
+| ROM4 window      | `$FA0000`  | `+0x0000`     | 128 KB   | ST-visible ROM-in-RAM                  |
+| Planar slot 0    | `$FA0000`  | `+0x0000`     | 32 000 B | Ready/render target planar framebuffer |
+| Planar slot 1    | `$FA7D00`  | `+0x7D00`     | 32 000 B | Ready/render target planar framebuffer |
+| Random token     | `$FAFA00`  | `+0xFA00`     | 4 B      | Completion sync token                  |
+| Token seed       | `$FAFA04`  | `+0xFA04`     | 4 B      | Seed for next token                    |
+| Async mailbox    | `$FAFA20`  | `+0xFA20`     | 36 B     | Frame submit/ready status and timings  |
+| Palette return   | `$FAFA80`  | `+0xFA80`     | 32 B     | 16 × STE `uint16_t` hardware colours   |
+| Shared variables | `$FAFC00`  | `+0xFC00`     | 1 KB     | Boot-stub shared state                 |
 
 ROM3 reads remain part of the command transport, so the second visible planar slot cannot live at `$FB0000`. Instead, ROM3 is used internally by the RP2040 as the second chunky staging buffer while both ST-visible planar slots stay in ROM4.
 
 ## Command reference
 
-| ID   | Name                  | d3                    | d4             | d5               | Inline buf      | RP2040 action                                           |
-| ---- | --------------------- | --------------------- | -------------- | ---------------- | --------------- | ------------------------------------------------------- |
-| 0x01 | `SDL_MD_INIT`         | `(width<<16)\|height` | `(bpp<<16)\|0` | 0                | —               | Clear buffers, reset palette, reset mailbox             |
-| 0x02 | `SDL_MD_QUIT`         | 0                     | 0              | 0                | —               | Clear buffers, reset palette, reset mailbox             |
-| 0x03 | `SDL_MD_SET_PALETTE`  | `(256<<16)\|0`        | 0              | 0                | 768 B (256×RGB) | Store palette for the next submitted frame              |
-| 0x04 | `SDL_MD_BLIT_SURFACE` | `(x<<16)\|y`          | `(w<<16)\|h`   | `(pitch<<16)\|0` | up to 1920 B    | Copy chunky rect into the current upload staging buffer |
-| 0x05 | `SDL_MD_FILL_RECT`    | `(x<<16)\|y`          | `(w<<16)\|h`   | `(color<<16)\|0` | —               | Fill rect in the current upload staging buffer          |
-| 0x06 | `SDL_MD_FLIP`         | `seq`                 | 0              | 0                | —               | Submit full-frame async conversion job                  |
-| 0x07 | `SDL_MD_UPDATE_RECT`  | `(x<<16)\|y`          | `(w<<16)\|h`   | `seq`            | —               | Submit partial async conversion job                     |
-| 0x08 | `SDL_MD_PING`         | `0x4D44534C`          | 0              | 0                | —               | Echo token (used for detection)                         |
-| 0x09 | `SDL_MD_RELEASE_FRAME`| `seq`                 | 0              | 0                | —               | Mark a presented planar slot reusable                   |
+| ID   | Name                   | d3                    | d4             | d5               | Inline buf      | RP2040 action                                           |
+| ---- | ---------------------- | --------------------- | -------------- | ---------------- | --------------- | ------------------------------------------------------- |
+| 0x01 | `SDL_MD_INIT`          | `(width<<16)\|height` | `(bpp<<16)\|0` | 0                | —               | Clear buffers, reset palette, reset mailbox             |
+| 0x02 | `SDL_MD_QUIT`          | 0                     | 0              | 0                | —               | Clear buffers, reset palette, reset mailbox             |
+| 0x03 | `SDL_MD_SET_PALETTE`   | `(256<<16)\|0`        | 0              | 0                | 768 B (256×RGB) | Store palette for the next submitted frame              |
+| 0x04 | `SDL_MD_BLIT_SURFACE`  | `(x<<16)\|y`          | `(w<<16)\|h`   | `(pitch<<16)\|0` | up to 1920 B    | Copy chunky rect into the current upload staging buffer |
+| 0x05 | `SDL_MD_FILL_RECT`     | `(x<<16)\|y`          | `(w<<16)\|h`   | `(color<<16)\|0` | —               | Fill rect in the current upload staging buffer          |
+| 0x06 | `SDL_MD_FLIP`          | `seq`                 | 0              | 0                | —               | Submit full-frame async conversion job                  |
+| 0x07 | `SDL_MD_UPDATE_RECT`   | `(x<<16)\|y`          | `(w<<16)\|h`   | `seq`            | —               | Submit partial async conversion job                     |
+| 0x08 | `SDL_MD_PING`          | `0x4D44534C`          | 0              | 0                | —               | Echo token (used for detection)                         |
+| 0x09 | `SDL_MD_RELEASE_FRAME` | `seq`                 | 0              | 0                | —               | Mark a presented planar slot reusable                   |
 
 A full 320×200 frame upload (`SDL_Flip`) uses 34 `SDL_MD_BLIT_SURFACE` commands (6 rows × 320 B = 1920 B each) followed by one `SDL_MD_FLIP(seq)`. A dirty-rect update (`SDL_UpdateRects`) sends only the changed rows via `SDL_MD_BLIT_SURFACE` then uses `SDL_MD_UPDATE_RECT(..., seq)` for the partial C2P (single rect) or `SDL_MD_FLIP(seq)` (multiple rects). The ST polls the mailbox on `Vsync()` or at the start of the next flip, presents any ready frame, then acknowledges it with `SDL_MD_RELEASE_FRAME(seq)`.
 
