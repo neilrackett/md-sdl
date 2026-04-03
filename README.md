@@ -43,7 +43,7 @@ ST copies ready slot◄──────────   blitter (STE) or CPU (ST
 Setscreen(screen RAM)              Shifter reads from ST RAM — no ROM4 contention
 ```
 
-Pointing `Setscreen` directly at ROM4 causes the Shifter to steal ROM4 bus cycles from the 68000 on every scanline, starving the BLIT_SURFACE commands. The SDL driver copies the finished planar frame to a screen-RAM buffer each frame and points `Setscreen` there instead. On STE the hardware blitter handles the copy in ~1 ms; on plain ST the CPU copy takes ~20 ms but still performs better than continuous Shifter contention.
+Pointing `Setscreen` directly at ROM4 causes the Shifter to steal ROM4 bus cycles from the 68000 on every scanline, starving the BLIT_SURFACE commands, so the SDL driver copies the finished planar frame to a screen-RAM buffer each frame and points `Setscreen` there instead. On STE the hardware blitter handles the copy in ~1 ms; on regular ST the CPU copy takes ~20 ms but still performs better than continuous Shifter contention.
 
 The palette return area at `$FAFA80` contains 16 STE-format `uint16_t` values. A mailbox at `$FAFA20` reports `submit_seq`, `ready_seq`, `palette_seq`, `worker_busy`, and timing counters. The random token at `$FAFA00` is still polled after every command to synchronise the ST with the RP2040.
 
