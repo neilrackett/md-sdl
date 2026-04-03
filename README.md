@@ -19,7 +19,7 @@ The plan is to outsource as much of SDL's graphics processing functionality to t
 - ✅ C2P processing: ~4ms for full-frame Bayer-mapped C2P
 - ✅ Palette reduction: ~0.1ms to create 16 colour palette from 256 using median cut
 - ✅ Pipelined parallel data processing: overlaps ST upload with RP2040 frame conversion
-- ✅ Dirty rect handling: android full-frame C2P if not needed
+- ✅ Dirty rect handling: avoid full-frame C2P if not needed
 - ✅ STE blitter path: ~1ms to copy planar data to screen
 - ✅ Up to ~25fps?
 
