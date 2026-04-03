@@ -12,18 +12,18 @@ The ST maintains a simple 320×200 8bpp chunky pixel surface in RAM. When the ap
 
 ## Progress
 
-Taking a get it working, make it better approach, the plan is to outsource as much of SDL's graphics processing functionality to the MD as possible, starting with the most CPU intensive and progressing from there.
+The plan is to outsource as much of SDL's graphics processing functionality to the MD as possible, starting with the most CPU intensive and progressing from there.
 
-### Implemented so far
+### Make it work
 
 - ✅ C2P processing: ~4ms for full-frame Bayer-mapped C2P
 - ✅ Palette reduction: ~0.1ms to create 16 colour palette from 256 using median cut
 - ✅ Pipelined parallel data processing: overlaps ST upload with RP2040 frame conversion
-- ✅ Dirty rect handling
+- ✅ Dirty rect handling: android full-frame C2P if not needed
 - ✅ STE blitter path: ~1ms to copy planar data to screen
 - ✅ Up to ~25fps?
 
-### Biggest remaining performance challenges
+### Make it better
 
 - 🤔 Cartridge upload time: ~50ms to push full 64KB surface
 - 🤔 Command overhead: 1-5ms for 34 BLIT_SURFACE commands plus FLIP
