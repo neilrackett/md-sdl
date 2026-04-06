@@ -4,7 +4,7 @@ Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by
 
 ## Introduction
 
-Unless you're lucky enough to own a TT or Falcon, you'd be lucky to achieve more than 1 or 2 FPS using the Atari ST version of SDL. Until now.
+Unless you're lucky enough to own a TT or Falcon, you'd be lucky to achieve more than 1-2 FPS using the Atari ST version of Simple DirectMedia Layer (SDL). Until now.
 
 Welcome to the SDL 1.2 video co-processor for the Atari ST with SidecarTridge Multi-device, or MD/SDL for short.
 
