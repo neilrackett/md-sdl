@@ -4,7 +4,9 @@ Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by
 
 ## Introduction
 
-Unless you're lucky enough to own a TT or Falcon, you'd be lucky to achieve more than 1 or 2 FPS using the Atari ST version of SDL. Until now. Welcome to the SDL 1.2 video co-processor for the Atari ST with SidecarTridge Multi-device, or MD/SDL for short.
+Unless you're lucky enough to own a TT or Falcon, you'd be lucky to achieve more than 1 or 2 FPS using the Atari ST version of SDL. Until now.
+
+Welcome to the SDL 1.2 video co-processor for the Atari ST with SidecarTridge Multi-device, or MD/SDL for short.
 
 MD/SDL turns the RP2040 inside the SidecarTridge into a graphics co-processor for SDL 1.2 applications — including Doom, Hexen, and Heretic — running on the Atari ST.
 
