@@ -4,22 +4,20 @@ Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by
 
 ## Introduction
 
-Unless you're lucky enough to own a TT or Falcon, you'd be lucky to achieve more than 1-2 FPS using the Atari ST version of Simple DirectMedia Layer (SDL). Until now.
+Unless you're lucky enough to own a TT or Falcon, you'd struggle to achieve more than 1-2 FPS using the Atari ST version of Simple DirectMedia Layer (SDL). Until now.
 
-Welcome to the SDL 1.2 video co-processor for the Atari ST with SidecarTridge Multi-device, or MD/SDL for short.
+Welcome to the SDL 1.2 video co-processor for the Atari ST with SidecarTridge Multi-device (MD), or MD/SDL for short.
 
-MD/SDL turns the RP2040 inside the SidecarTridge into a graphics co-processor for SDL 1.2 applications — including Doom, Hexen, and Heretic — running on the Atari ST.
+MD/SDL turns the RP2040 inside the MD into a graphics co-processor for SDL 1.2 applications — including Doom and Rise of the Triad — running on the Atari ST.
 
-The ST maintains a simple 320×200 8bpp chunky pixel surface in RAM. When the application calls `SDL_Flip()`, the ST sends that surface to the RP2040 over the cartridge bus. The RP2040 performs 256→16 colour palette reduction using median cut, precomputes Bayer-dithered palette mappings, converts the result from chunky to ST planar format (C2P), and writes the finished frame into one of two ST-visible planar slots in the ROM4 window. The ST copies the ready slot back to screen RAM, so there is no software C2P on the 68000 at all.
+## Goals & Progress
 
-## Progress
-
-The plan is to outsource as much of SDL's graphics processing functionality to the MD as possible, starting with the most CPU intensive and progressing from there.
+The aim is this project of to make it as easy to port SDL content to the Atari ST as it is for TT and Falcon by outsourcing as much of SDL's graphics processing functionality to the MD as possible, starting with the most CPU intensive and progressing from there.
 
 ### Make it work
 
 - ✅ C2P processing: ~4ms for full-frame Bayer-mapped C2P
-- ✅ Palette reduction: ~0.1ms to create 16 colour palette from 256 using median cut
+- ✅ Palette reduction: ~0.1ms to create 16 colour palette and Bayer mappings from 256 using median cut
 - ✅ Pipelined parallel data processing: overlaps ST upload with RP2040 frame conversion
 - ✅ Dirty rect handling: avoid full-frame C2P if not needed
 - ✅ STE blitter path: ~1ms to copy planar data to screen
@@ -32,6 +30,8 @@ The plan is to outsource as much of SDL's graphics processing functionality to t
 - 🤔 ST-side display copy: 20ms without blitter to copy planar data to screen
 
 ## How it works
+
+The ST maintains a simple 320×200 8bpp chunky pixel surface in RAM. When the application calls `SDL_Flip()`, the ST sends that surface to the RP2040 over the cartridge bus. The RP2040 performs 256→16 colour palette reduction using median cut, precomputes Bayer-dithered palette mappings, converts the result from chunky to ST planar format (C2P), and writes the finished frame into one of two ST-visible planar slots in the ROM4 window. The ST copies the ready slot back to screen RAM, so there is no software C2P on the 68000 at all.
 
 ```
 Atari ST (68000)                          RP2040
@@ -52,8 +52,8 @@ The palette return area at `$FAFA80` contains 16 STE-format `uint16_t` values. A
 ## Hardware requirements
 
 - [SidecarTridge Multi-device](https://sidecartridge.com) (RP2040-based ROM cartridge emulator)
-- Atari ST or STE (not TT or Falcon — the driver targets ST low-res only)
-- Raspberry Pi Debug Probe or Picoprobe for flashing/debugging (optional but recommended)
+- Atari ST or STE (TT and Falcon continue to use their existing SDL video drivers)
+- Raspberry Pi Debug Probe or Picoprobe for flashing/debugging (optional but recommended for development)
 
 ## Repository structure
 
