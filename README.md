@@ -8,7 +8,7 @@ Unless you're lucky enough to own a TT or Falcon, you'd struggle to achieve more
 
 Welcome to the SDL 1.2 video co-processor for the Atari ST with SidecarTridge Multi-device (MD), or MD/SDL for short.
 
-MD/SDL turns the RP2040 inside the MD into a graphics co-processor for SDL 1.2 applications — including Doom and Rise of the Triad — running on the Atari ST.
+MD/SDL turns the RP2040 inside the MD into a graphics co-processor for SDL 1.2 applications running on the Atari ST, including [Doom](https://github.com/neilrackett/atarist-doom) and [Rise of the Triad](https://github.com/neilrackett/atarist-rott).
 
 ## Goals & Progress
 
@@ -28,6 +28,8 @@ The aim is this project of to make it as easy to port SDL content to the Atari S
 - 🤔 Cartridge upload time: ~50ms to push full 64KB surface
 - 🤔 Command overhead: 1-5ms for 34 BLIT_SURFACE commands plus FLIP
 - 🤔 ST-side display copy: 20ms without blitter to copy planar data to screen
+
+_If you have any ideas for boosting performance, please feel free to submit a a PR!_
 
 ## How it works
 
@@ -89,7 +91,7 @@ SDL_Surface *screen = SDL_SetVideoMode(320, 200, 8, SDL_HWPALETTE);
 SDL_Flip(screen);   /* uploads chunky surface, triggers C2P on RP2040 */
 ```
 
-`SDL_SetColors()` sends the full 256-entry palette to the RP2040 for median-cut reduction. The firmware precomputes 4×4 Bayer-phase palette maps so `SDL_Flip()` and `SDL_UpdateRects()` can ordered-dither indexed pixels during C2P. `SDL_Flip()` and `SDL_UpdateRects()` now submit asynchronous conversion work; the ST presents the most recent ready planar slot on `Vsync()` or at the start of the next flip.
+`SDL_SetColors()` sends the full 256-entry palette to the RP2040 for median-cut reduction. The firmware precomputes 4×4 Bayer-phase palette maps so `SDL_Flip()` and `SDL_UpdateRects()` can ordered-dither indexed pixels during C2P. `SDL_Flip()` and `SDL_UpdateRects()` submit asynchronous conversion work; the ST presents the most recent ready planar slot on `Vsync()` or at the start of the next flip.
 
 ## Memory layout
 
