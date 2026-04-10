@@ -1,4 +1,4 @@
-# MD/SDL: SDL Coprocessor for the Atari ST
+# MD/SDL: SDL Coprocessor for Atari ST
 
 Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by [Neil Rackett](https://x.com/neilrackett)
 
