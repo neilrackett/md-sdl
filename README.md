@@ -6,9 +6,9 @@ Microfirmware for the [SidecarTridge Multi-device](https://sidecartridge.com) by
 
 Unless you're lucky enough to own a TT or Falcon, you'd struggle to achieve more than 1-2 FPS using the Atari ST version of Simple DirectMedia Layer (SDL). Until now.
 
-Welcome to the SDL 1.2 video co-processor for the Atari ST with SidecarTridge Multi-device (MD), or MD/SDL for short.
+Welcome to the SDL 1.2 video coprocessor for the Atari ST with SidecarTridge Multi-device (MD), or MD/SDL for short.
 
-MD/SDL turns the RP2040 inside the MD into a graphics co-processor for SDL 1.2 applications running on the Atari ST, including [Doom](https://github.com/neilrackett/atarist-doom) and [Rise of the Triad](https://github.com/neilrackett/atarist-rott).
+MD/SDL turns the RP2040 inside the MD into a graphics coprocessor for SDL 1.2 applications running on the Atari ST, including [Doom](https://github.com/neilrackett/atarist-doom) and [Rise of the Triad](https://github.com/neilrackett/atarist-rott).
 
 ## Goals & Progress
 
