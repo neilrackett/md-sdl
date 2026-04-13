@@ -1,7 +1,7 @@
 {
   "uuid": "<APP_UUID>",
   "name": "MD/SDL",
-  "description": "SDL coprocessor for Atari ST",
+  "description": "MD/SDL: SDL Coprocessor for Atari ST",
   "image": "https://placehold.co/256x256/png",
   "tags": [
     "SDL",

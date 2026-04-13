@@ -58,3 +58,7 @@ upload_s3.sh
 build/
 dist/
 build-*/
+
+.DS_Store
+/uuid.txt
+.cache

@@ -12,6 +12,7 @@ target_include_directories(httpc PUBLIC
 # Link necessary libraries
 target_link_libraries(httpc PRIVATE
     pico_stdlib    # Core Pico SDK library
+    pico_async_context_poll  # Async context for HTTP operations
     pico_lwip_http
     pico_lwip_mbedtls
     pico_mbedtls
