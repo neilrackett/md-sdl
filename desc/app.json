@@ -5,11 +5,9 @@
   "image": "https://placehold.co/256x256/png",
   "tags": [
     "SDL",
-    "Coprocessor",
+    "GPU",
     "C2P",
-    "Games",
-    "Graphics",
-    "XBIOS"
+    "Game"
   ],
   "devices": [
     "Atari ST",
