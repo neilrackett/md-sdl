@@ -2,7 +2,7 @@
   "uuid": "<APP_UUID>",
   "name": "MD/SDL",
   "description": "MD/SDL: SDL Coprocessor for Atari ST",
-  "image": "https://placehold.co/256x256/png",
+  "image": "https://atarist.neilrackett.com/<APP_UUID>.png",
   "tags": [
     "SDL",
     "GPU",
@@ -15,7 +15,7 @@
     "Atari MegaST",
     "Atari MegaSTE"
   ],
-  "binary": "https://atarist.sidecartridge.com/<APP_UUID>-<APP_VERSION>.uf2",
+  "binary": "https://atarist.neilrackett.com/<APP_UUID>-<APP_VERSION>.uf2",
   "md5": "<BINARY_MD5_HASH>",
   "version": "<APP_VERSION>"
 }
