@@ -19,7 +19,6 @@
 
 #include "constants.h"
 #include "debug.h"
-#include "display.h"
 #include "hardware/sync.h"
 #include "memfunc.h"
 #include "pico/critical_section.h"
@@ -1021,16 +1020,6 @@ void emul_start(void) {
 
     /* Copy the ST-side boot stub into ROM_IN_RAM */
     COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length);
-
-    /* Render the boot message into the startup display buffer.
-     * This is independent from the async SDL frame slots and is cleared on the
-     * first SDL_MD_INIT/SDL_MD_QUIT reset path. */
-    display_setupU8g2();
-    u8g2_t *u8g2 = display_getU8g2Ref();
-    u8g2_ClearBuffer(u8g2);
-    u8g2_SetFont(u8g2, u8g2_font_squeezed_b7_tr);
-    u8g2_DrawStr(u8g2, 4, 12, "MD/SDL: SDL coprocessor is ready");
-    u8g2_SendBuffer(u8g2);
 
     sdl_md_launch_worker_if_needed();
 

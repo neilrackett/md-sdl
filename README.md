@@ -66,7 +66,7 @@ rp/src/              RP2040 firmware (C, Pico SDK)
     sdl_commands.h   Command IDs, address offsets, surface size constants
 
 target/atarist/      Atari ST ROM stub (68000 assembly)
-  src/main.s         ROM cartridge header, detect_hw, boot message trigger
+  src/main.s         ROM cartridge header + minimal pre-auto hardware handshake
 
 pico-sdk/            Raspberry Pi Pico SDK v2.2.0 (git submodule)
 pico-extras/         Pico Extras sdk-2.2.0 (git submodule)
@@ -196,13 +196,9 @@ picotool load dist/<UUID>-v<version>.uf2 --force
 
 ## Boot behaviour
 
-On boot the RP2040 renders a message into the planar framebuffer before the cartridge bus goes live. The ST's boot stub copies this to screen memory every vsync, so the following appears on the ST display before the desktop loads:
-
-```
-MD/SDL: SDL coprocessor is ready
-```
-
-MD/SDL then hands control back to TOS normally and waits silently for SDL commands.
+MD/SDL does not render a boot banner into the ST planar framebuffer.
+On boot, the RP2040 initializes the command/mailbox pipeline and then waits for
+SDL commands.
 
 ## Verifying with UART (debug build)
 

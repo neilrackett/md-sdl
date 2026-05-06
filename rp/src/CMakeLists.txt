@@ -86,9 +86,6 @@ pico_sdk_init()
 
 add_subdirectory(settings)
 
-# Add u8g2 library
-add_subdirectory(u8g2)
-
 # Add HTTP client library
 add_subdirectory(httpc)
 
@@ -105,8 +102,6 @@ pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/romemul.pio)
 target_sources(${PROJECT_NAME} PRIVATE
         aconfig.c
         blink.c
-        display.c
-        display_term.c
         emul.c
         gconfig.c
         hw_config.c
@@ -128,7 +123,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     pico_stdlib              # Core functionality
     pico_multicore          # Multicore support
     settings                 # Custom settings library
-    u8g2                     # for display
 )
 
 # Conditionally link the CYW43 architecture library if supported

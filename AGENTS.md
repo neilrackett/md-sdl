@@ -81,7 +81,7 @@ Important: ROM3 reads are still part of the command transport. Do not repurpose 
 ## 7. Build notes & gotchas
 
 - The build produces no output on success from `git submodule update` lines — that's normal.
-- `ADDRESS_HIGH_BIT` is **not** imported from `term.h` (which is not included); use `0x8000u` directly in `emul.c`.
+- `ADDRESS_HIGH_BIT` is not defined by project headers; use `0x8000u` directly in `emul.c`.
 - `PICO_TOOLCHAIN_PATH` must be exported **before** running `./build.sh` — the rp/build.sh does not set it.
 - Expect harmless linker warnings (`ignoring duplicate libraries: 'errors/liberrors.a'`).
 - The Atari ST build emits "not a TTY" and "Failed to resize the file" — these are from Docker/stcmd and are harmless.
@@ -99,7 +99,7 @@ Pointing `Setscreen` at ROM4 causes the Shifter to steal ~800 000 ROM4 reads/sec
 | Symptom | Fix |
 |---|---|
 | `arm-none-eabi-gcc not found` | Set `PICO_TOOLCHAIN_PATH` to the `bin/` directory of your ARM GNU Toolchain install |
-| `ADDRESS_HIGH_BIT undeclared` | Replace with the literal `0x8000u` — `term.h` is not included in `emul.c` |
+| `ADDRESS_HIGH_BIT undeclared` | Replace with the literal `0x8000u` in `emul.c` |
 | UF2 not found after build | RP compile failed — scroll up to the first error before the copy step |
 | ST hangs polling `$FAFA00` | Bus sync failure — confirm UF2 is flashed; check UART log |
 
