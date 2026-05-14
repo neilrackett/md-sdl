@@ -1,7 +1,7 @@
 {
   "uuid": "<APP_UUID>",
-  "name": "MD/SDL",
-  "description": "MD/SDL: SDL Coprocessor for Atari ST",
+  "name": "MD/SDL: SDL Coprocessor",
+  "description": "MD/SDL: SDL 1.2 Coprocessor for Atari ST",
   "image": "https://atarist.neilrackett.com/<APP_UUID>.png",
   "tags": [
     "SDL",

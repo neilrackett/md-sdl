@@ -10,10 +10,8 @@ if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
     exit 1
 fi
 
-# Copy the version.txt to each project
-echo "Copy version.txt to each project"
-cp version.txt rp/
-cp version.txt target/
+# Increment patch version in root version.txt on every build run and sync sub-project files
+"$SCRIPT_DIR/tools/bump_version.sh" --repo-root "$SCRIPT_DIR"
 
 # Display the version information
 export VERSION=$(cat version.txt)
